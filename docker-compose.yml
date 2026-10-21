@@ -1,0 +1,20 @@
+services:
+  vanguarea-bot:
+    build: .
+    container_name: vanguarea-bot
+    restart: unless-stopped
+    env_file: .env
+    # Accès à l'hôte nécessaire pour la surveillance :
+    pid: host            # voir les processus et le réseau de l'hôte (/proc/1/net)
+    network_mode: host   # mesurer le trafic réel des interfaces
+    cap_add:
+      - SYS_PTRACE       # associer les ports en écoute aux processus
+    volumes:
+      - /:/host:ro                                  # système de fichiers de l'hôte (lecture seule)
+      - /var/run/docker.sock:/var/run/docker.sock   # état des conteneurs + scan des images
+      - ./data:/data                                # état du bot + cache Trivy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

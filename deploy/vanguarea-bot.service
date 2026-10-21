@@ -1,0 +1,22 @@
+# Installation directement sur l'hôte (alternative à Docker) :
+#   sudo cp deploy/vanguarea-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now vanguarea-bot
+[Unit]
+Description=Vanguarea - bot Telegram de surveillance du VPS
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/vanguarea-bot
+EnvironmentFile=/opt/vanguarea-bot/.env
+Environment=HOST_ROOT=/
+Environment=STATE_FILE=/var/lib/vanguarea-bot/state.json
+Environment=TRIVY_CACHE_DIR=/var/lib/vanguarea-bot/trivy-cache
+StateDirectory=vanguarea-bot
+ExecStart=/opt/vanguarea-bot/.venv/bin/python -m vanguarea_bot
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
