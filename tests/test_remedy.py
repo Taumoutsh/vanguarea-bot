@@ -22,9 +22,42 @@ def test_host_apt_advice_and_kernel_reboot():
         vuln("openssl", "3.0.1", "3.0.2", cls="os-pkgs", pkg_type="debian"),
         vuln("linux-image-amd64", "6.1.1", "6.1.2", cls="os-pkgs", pkg_type="debian", cve_id="CVE-2"),
     ])
-    text = remedy.advise(Config(token="x", chat_ids=frozenset({1})), [result], {})[1]
-    assert "apt-get install --only-upgrade linux-image-amd64 openssl" in text
-    assert "redémarrage" in text
+    text = remedy.advise_host(result, running_kernel="6.1.0-18-amd64")
+    assert "<pre>sudo apt-get install --only-upgrade -y linux-image-amd64 openssl</pre>" in text
+    assert "<pre>sudo apt-get update &amp;&amp; sudo apt-get install" in text  # tout en une ligne
+    assert "sudo reboot" in text
+
+
+def test_versioned_kernel_packages_use_metapackage():
+    result = cve.TargetResult("hôte", [
+        vuln("linux-image-6.8.0-45-generic", "6.8.0-45.45", "6.8.0-50.51", cls="os-pkgs", pkg_type="ubuntu"),
+        vuln("linux-headers-6.8.0-45-generic", "6.8.0-45.45", "6.8.0-50.51", cls="os-pkgs", pkg_type="ubuntu",
+             cve_id="C2"),
+        vuln("linux-image-6.8.0-40-generic", "6.8.0-40.40", "6.8.0-50.51", cls="os-pkgs", pkg_type="ubuntu",
+             cve_id="C3"),
+    ])
+    text = remedy.advise_host(result, running_kernel="6.8.0-45-generic")
+    # On ne demande jamais de mettre à jour le paquet versionné déjà installé...
+    assert "install --only-upgrade -y linux-headers-generic linux-image-generic</pre>" in text
+    assert "install --only-upgrade -y linux-image-6.8.0" not in text
+    # ... et l'ancien noyau inutilisé est à supprimer.
+    assert "autoremove --purge" in text
+    assert "sudo reboot" in text
+
+
+def test_third_party_go_binary_in_built_image(tmp_path: Path):
+    # Cas réel : trivy copié depuis aquasec/trivy dans l'image du bot, sans go.mod dans le projet.
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
+    cfg = Config(token="x", chat_ids=frozenset({1}))
+    ctx = ImageContext("bot:latest", "bot-1", "vanguarea-bot", "vanguarea-bot", str(tmp_path), built=True)
+    vulns = [cve.Vuln(c, "CRITICAL", p, i, f, "", "", "lang-pkgs", "gobinary", "usr/local/bin/trivy")
+             for c, p, i, f in [("C1", "github.com/aquasecurity/trivy", "v0.58.1", "0.71.1"),
+                                ("C2", "golang.org/x/crypto", "v0.31.0", "0.55.0"),
+                                ("C3", "stdlib", "v1.23.4", "1.26.10")]]
+    text = remedy.advise(cfg, [cve.TargetResult("bot:latest", vulns)], {"bot:latest": [ctx]})[1]
+    assert "Binaire tiers" in text and "/usr/local/bin/trivy" in text
+    assert "≥ <b>0.71.1</b>" in text
+    assert "go get" not in text
 
 
 def test_built_image_npm_direct_and_indirect(tmp_path: Path):
@@ -49,12 +82,17 @@ def test_third_party_image_pull(tmp_path: Path):
     assert remedy.advise(cfg, [result], {"postgres:16": [ctx]}, project="autre")[0].startswith("✅")
 
 
-def test_go_stdlib_and_last_results_roundtrip(tmp_path: Path):
+def test_own_go_project_single_go_get_and_roundtrip(tmp_path: Path):
+    (tmp_path / "go.mod").write_text("module example.com/monapp\n\ngo 1.22\n")
     state = State(tmp_path / "s.json")
-    result = cve.TargetResult("svc", [vuln("stdlib", "1.21.0", "1.21.8", pkg_type="gobinary"),
-                                      vuln("golang.org/x/net", "0.17.0", "0.23.0", pkg_type="gobinary", cve_id="C2")])
-    cve.record_and_diff([result], state)
+    vulns = [cve.Vuln(c, "CRITICAL", p, i, f, "", "", "lang-pkgs", "gobinary", "app/server")
+             for c, p, i, f in [("C1", "example.com/monapp", "v0.0.0", ""),
+                                ("C2", "golang.org/x/net", "v0.17.0", "0.23.0"),
+                                ("C3", "golang.org/x/crypto", "v0.17.0", "0.31.0"),
+                                ("C4", "stdlib", "v1.21.0", "1.21.8")]]
+    cve.record_and_diff([cve.TargetResult("svc", vulns)], state)
     loaded = cve.last_results(State(tmp_path / "s.json"))
-    text = remedy.advise(Config(token="x", chat_ids=frozenset({1})), loaded, {})[1]
-    assert "go get golang.org/x/net@v0.23.0" in text
+    ctx = ImageContext("svc", "svc-1", "monapp", "api", str(tmp_path), built=True)
+    text = remedy.advise(Config(token="x", chat_ids=frozenset({1})), loaded, {"svc": [ctx]})[1]
+    assert "<pre>go get golang.org/x/crypto@v0.31.0 golang.org/x/net@v0.23.0</pre>" in text
     assert "golang:1.21.8" in text

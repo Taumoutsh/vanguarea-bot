@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -62,6 +63,49 @@ def _code(cmd: str) -> str:
     return f"<pre>{esc(cmd)}</pre>"
 
 
+def _steps(cmds: list[str]) -> list[str]:
+    """Commandes à copier : d'un bloc (une seule ligne, s'arrête à la première erreur) ou une par une.
+
+    Chaque commande est dans son propre bloc pour que le bouton « copier » de Telegram
+    ne prenne qu'elle : un collage multi-ligne dans un terminal SSH est peu fiable.
+    """
+    if len(cmds) == 1:
+        return [_code(cmds[0])]
+    return ["📋 <i>Tout en une fois :</i>", _code(" && ".join(cmds)),
+            "<i>ou une commande à la fois :</i>", *(_code(c) for c in cmds)]
+
+
+# Paquet noyau dont le nom contient la version : linux-image-6.8.0-45-generic, linux-headers-6.1.0-18-amd64...
+KERNEL_PKG = re.compile(
+    r"^linux-(?P<kind>image|headers|modules(?:-extra)?)-(?:unsigned-)?(?P<release>\d+\.\d+\.\d+-\d+(?:\.\d+)?)-(?P<flavor>[a-z][a-z0-9-]*)$"
+)
+
+
+def _split_kernel_packages(pkgs: list[str], running_kernel: str) -> tuple[list[str], list[str], bool]:
+    """Remplace les paquets noyau versionnés par leur méta-paquet.
+
+    Un paquet « linux-image-6.8.0-45-generic » ne se met jamais à jour : le correctif arrive
+    dans un nouveau paquet (6.8.0-50) installé via le méta-paquet « linux-image-generic ».
+    Retourne (paquets à mettre à jour, anciens noyaux inutilisés, noyau en cours concerné).
+    """
+    upgrade: list[str] = []
+    old: list[str] = []
+    running_affected = False
+    for pkg in pkgs:
+        m = KERNEL_PKG.match(pkg)
+        if not m:
+            upgrade.append(pkg)
+            continue
+        if f"{m['release']}-{m['flavor']}" != running_kernel:
+            old.append(pkg)
+            continue
+        running_affected = True
+        meta = f"linux-headers-{m['flavor']}" if m["kind"] == "headers" else f"linux-image-{m['flavor']}"
+        if meta not in upgrade:
+            upgrade.append(meta)
+    return upgrade, old, running_affected
+
+
 def _find_file(root: Path, name: str, depth: int = 2) -> Path | None:
     if (root / name).is_file():
         return root / name
@@ -91,25 +135,41 @@ def _npm_direct_deps(package_json: Path | None) -> set[str]:
     return deps
 
 
-def os_package_advice(pkg_type: str, fixes: dict, in_image: bool) -> list[str]:
-    pkgs = " ".join(sorted(fixes))
+def os_package_advice(pkg_type: str, fixes: dict, in_image: bool, running_kernel: str = "") -> list[str]:
+    lines = [f"• <code>{esc(pkg)}</code> {esc(installed)} → <b>{esc(target)}</b> ({esc(', '.join(cves[:3]))})"
+             for pkg, (installed, target, cves) in sorted(fixes.items())]
+    if in_image:
+        return lines
+
+    pkgs = sorted(fixes)
+    old_kernels: list[str] = []
+    kernel_update = False
     if pkg_type in APT_FAMILY:
-        cmd = f"sudo apt-get update && sudo apt-get install --only-upgrade {pkgs}"
+        pkgs, old_kernels, kernel_update = _split_kernel_packages(pkgs, running_kernel)
+    kernel_update = kernel_update or any(p.startswith(("linux-image", "kernel", "linux-generic")) for p in pkgs)
+
+    names = " ".join(pkgs)
+    if not pkgs:
+        cmds = []
+    elif pkg_type in APT_FAMILY:
+        cmds = ["sudo apt-get update", f"sudo apt-get install --only-upgrade -y {names}"]
     elif pkg_type in DNF_FAMILY:
-        cmd = f"sudo dnf upgrade {pkgs}"
+        cmds = [f"sudo dnf upgrade -y {names}"]
     elif pkg_type == "alpine":
-        cmd = f"apk upgrade {pkgs}"
+        cmds = ["apk update", f"apk upgrade {names}"]
     elif pkg_type in ("suse linux enterprise server", "opensuse.leap", "opensuse.tumbleweed"):
-        cmd = f"sudo zypper update {pkgs}"
+        cmds = [f"sudo zypper update -y {names}"]
     else:
-        cmd = None
-    lines = []
-    for pkg, (installed, target, cves) in sorted(fixes.items()):
-        lines.append(f"• <code>{esc(pkg)}</code> {esc(installed)} → <b>{esc(target)}</b> ({esc(', '.join(cves[:3]))})")
-    if not in_image and cmd:
-        lines.append(_code(cmd))
-    if not in_image and any(p.startswith(("linux-image", "kernel", "linux-generic")) for p in fixes):
-        lines.append("🔁 Mise à jour du noyau : redémarrage nécessaire (<code>sudo reboot</code>).")
+        cmds = []
+    if cmds:
+        lines.append("<b>Mettre à jour</b>")
+        lines += _steps(cmds)
+    if old_kernels:
+        lines.append(f"<b>Anciens noyaux inutilisés</b> ({esc(', '.join(old_kernels))}) : à supprimer")
+        lines += _steps(["sudo apt-get autoremove --purge -y"])
+    if kernel_update:
+        lines.append("🔁 Nouveau noyau : redémarrer ensuite le serveur pour l'utiliser")
+        lines += _steps(["sudo reboot"])
     return lines
 
 
@@ -152,14 +212,7 @@ def lang_advice(vulns: list[Vuln], workdir: Path | None, host_root: Path = Path(
             lines.append(f"<b>Python</b> : mettre à jour {where}")
             lines.append(_code("\n".join(f"{p}>={t}" for p, (_, t, _) in sorted(fixes.items()))))
         elif eco == "go" and fixes:
-            stdlib = fixes.pop("stdlib", None)
-            if fixes:
-                cmds = [f"go get {p}@v{t.lstrip('v')}" for p, (_, t, _) in sorted(fixes.items())] + ["go mod tidy"]
-                lines.append("<b>Go</b>")
-                lines.append(_code("\n".join(cmds)))
-            if stdlib:
-                lines.append(f"<b>Go stdlib</b> : compiler avec Go ≥ <b>{esc(stdlib[1])}</b> "
-                             f"(ex. <code>FROM golang:{esc(stdlib[1])}</code> dans le Dockerfile)")
+            lines += go_advice(eco_vulns, workdir, host_root)
         elif fixes:
             lines.append(f"<b>{esc(eco)}</b>")
             lines += [f"• <code>{esc(p)}</code> {esc(i)} → <b>{esc(t)}</b>" for p, (i, t, _) in sorted(fixes.items())]
@@ -168,7 +221,61 @@ def lang_advice(vulns: list[Vuln], workdir: Path | None, host_root: Path = Path(
     return lines
 
 
-def advise_host(result: TargetResult) -> str:
+def _go_module(workdir: Path | None) -> tuple[Path | None, str | None]:
+    go_mod = _find_file(workdir, "go.mod") if workdir else None
+    if not go_mod:
+        return None, None
+    try:
+        m = re.search(r"^module\s+(\S+)", go_mod.read_text(), re.MULTILINE)
+    except OSError:
+        return go_mod, None
+    return go_mod, m.group(1) if m else None
+
+
+def go_advice(vulns: list[Vuln], workdir: Path | None, host_root: Path = Path("/")) -> list[str]:
+    """Go : dépendances du projet (go get) ou binaires tiers embarqués dans l'image (à mettre à jour)."""
+    go_mod, module = _go_module(workdir)
+    by_binary: dict[str, list[Vuln]] = defaultdict(list)
+    for v in vulns:
+        by_binary[v.path if v.pkg_type == "gobinary" else "go.mod"].append(v)
+
+    lines: list[str] = []
+    own: list[Vuln] = []
+    for binary, bvulns in sorted(by_binary.items()):
+        pkgs = {v.pkg for v in bvulns}
+        if binary == "go.mod" or (module and module in pkgs):
+            own += bvulns
+            continue
+        # Binaire tiers (ex. trivy copié depuis une autre image) : on ne modifie pas son go.mod,
+        # on installe une version plus récente de l'outil.
+        name = binary.rstrip("/").rsplit("/", 1)[-1]
+        fixes = _fixes(bvulns)
+        main = next((p for p in fixes if p.rstrip("/").rsplit("/", 1)[-1] == name), None)
+        lines.append(f"<b>Binaire tiers</b> <code>/{esc(binary.lstrip('/'))}</code> : {len(bvulns)} CVE")
+        if main:
+            lines.append(f"→ Mettre à jour <b>{esc(name)}</b> en version ≥ <b>{esc(fixes[main][1])}</b> "
+                         f"(actuellement {esc(fixes[main][0])}), ex. le tag de l'image dans "
+                         f"<code>COPY --from=…</code> du Dockerfile.")
+        else:
+            lines.append(f"→ Mettre à jour <b>{esc(name)}</b> vers sa dernière version (dépendances obsolètes).")
+
+    if own:
+        fixes = _fixes(own)
+        stdlib = fixes.pop("stdlib", None)
+        if fixes:
+            where = f" (dans <code>{esc(_shown(go_mod.parent, host_root))}</code>)" if go_mod else ""
+            lines.append(f"<b>Go</b>{where}")
+            cmds = ([f"cd {_shown(go_mod.parent, host_root)}"] if go_mod else [])
+            cmds += ["go get " + " ".join(f"{p}@v{t.lstrip('v')}" for p, (_, t, _) in sorted(fixes.items())),
+                     "go mod tidy"]
+            lines += _steps(cmds)
+        if stdlib:
+            lines.append(f"<b>Go stdlib</b> : compiler avec Go ≥ <b>{esc(stdlib[1])}</b> "
+                         f"(ex. <code>FROM golang:{esc(stdlib[1])}</code> dans le Dockerfile)")
+    return lines
+
+
+def advise_host(result: TargetResult, running_kernel: str | None = None) -> str:
     lines = ["🖥 <b>Serveur</b>"]
     os_vulns = [v for v in result.vulns if v.cls == "os-pkgs"]
     lang_vulns = [v for v in result.vulns if v.cls != "os-pkgs"]
@@ -179,7 +286,8 @@ def advise_host(result: TargetResult) -> str:
         for pkg_type, vulns in by_type.items():
             fixes = _fixes(vulns)
             if fixes:
-                lines += os_package_advice(pkg_type, fixes, in_image=False)
+                lines += os_package_advice(pkg_type, fixes, in_image=False,
+                                           running_kernel=running_kernel or os.uname().release)
     if lang_vulns:
         lines.append("Dépendances applicatives installées sur le serveur :")
         for v in lang_vulns:
@@ -198,15 +306,15 @@ def advise_image(cfg: Config, result: TargetResult, contexts: list[ImageContext]
     lang_vulns = [v for v in result.vulns if v.cls != "os-pkgs"]
     workdir = cfg.host_path(ctx.workdir) if ctx and ctx.workdir else None
     svc = " ".join(services)
-    cd = f"cd {ctx.workdir} && " if ctx and ctx.workdir else ""
 
     if ctx and not ctx.built:
         # Image tierce (postgres, nginx, redis...) : il faut une version plus récente de l'image.
         lines.append(f"Image tierce : {len(result.vulns)} CVE corrigée(s) dans une version plus récente.")
         if ctx.project:
-            lines.append(_code(f"{cd}docker compose pull {svc}\n{cd}docker compose up -d {svc}"))
+            lines += _steps([f"cd {ctx.workdir}", f"docker compose pull {svc}", f"docker compose up -d {svc}"])
         else:
-            lines.append(_code(f"docker pull {result.target}  # puis recréer le conteneur {ctx.container}"))
+            lines += _steps([f"docker pull {result.target}"])
+            lines.append(f"puis recréer le conteneur <code>{esc(ctx.container)}</code>.")
         lines.append("Si la CVE persiste après le pull, le tag est figé : passez à une version plus récente "
                      "de l'image dans votre docker-compose.yml.")
         return "\n".join(lines)
@@ -227,15 +335,17 @@ def advise_image(cfg: Config, result: TargetResult, contexts: list[ImageContext]
 
     lines.append("")
     lines.append("<b>Puis redéployer</b>")
-    steps = []
+    steps = [f"cd {ctx.workdir}"] if ctx and ctx.workdir else []
     if lang_vulns:
-        steps.append(f'{cd}git commit -am "fix(security): mise à jour des dépendances vulnérables" && git push')
+        steps += ['git commit -am "fix(security): mise à jour des dépendances vulnérables"', "git push"]
     if ctx and ctx.project:
-        steps.append(f"{cd}docker compose build --pull{' --no-cache' if os_vulns else ''} {svc}")
-        steps.append(f"{cd}docker compose up -d {svc}")
+        steps += [f"docker compose build --pull{' --no-cache' if os_vulns else ''} {svc}",
+                  f"docker compose up -d {svc}"]
     else:
-        steps.append(f"docker build --pull -t {result.target} .  # puis recréer le conteneur")
-    lines.append(_code("\n".join(steps)))
+        steps.append(f"docker build --pull -t {result.target} .")
+    lines += _steps(steps)
+    if not (ctx and ctx.project):
+        lines.append("puis recréer le conteneur.")
     return "\n".join(lines)
 
 

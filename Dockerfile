@@ -1,6 +1,6 @@
 # Version de Trivy (scanner de CVE). Gardez-la à jour : les OS récents
 # (ex. Debian 13, Ubuntu 26.04) ne sont reconnus que par les versions récentes.
-ARG TRIVY_VERSION=0.58.1
+ARG TRIVY_VERSION=0.75.0
 FROM aquasec/trivy:${TRIVY_VERSION} AS trivy
 
 FROM python:3.12-slim
