@@ -7,7 +7,7 @@ import logging
 import shutil
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 from ..config import Config
 from ..state import State
@@ -33,6 +33,9 @@ class Vuln:
     fixed: str
     title: str
     url: str
+    cls: str = ""  # "os-pkgs" ou "lang-pkgs"
+    pkg_type: str = ""  # debian, npm, node-pkg, pip, python-pkg, gomod, gobinary...
+    path: str = ""  # fichier concerné dans l'image (lockfile, METADATA, binaire...)
 
 
 @dataclass
@@ -55,6 +58,9 @@ def parse_trivy_json(raw: str) -> list[Vuln]:
                 fixed=v.get("FixedVersion", ""),
                 title=(v.get("Title") or "").strip(),
                 url=v.get("PrimaryURL") or f"https://avd.aquasec.com/nvd/{v.get('VulnerabilityID', '').lower()}",
+                cls=result.get("Class", ""),
+                pkg_type=result.get("Type", ""),
+                path=v.get("PkgPath") or result.get("Target", ""),
             )
             vulns[(vuln.pkg, vuln.cve)] = vuln
     return list(vulns.values())
@@ -140,8 +146,16 @@ def record_and_diff(results: list[TargetResult], state: State) -> list[TargetRes
                        "critical": sum(1 for v in r.vulns if v.severity == "CRITICAL")}
             for r in results
         }
+        cve_state["last_results"] = [asdict(r) for r in results]
         state.save()
     return new_results
+
+
+def last_results(state: State) -> list[TargetResult]:
+    """Résultats complets du dernier scan (pour /fix)."""
+    with state.lock:
+        raw = state.data.get("cve", {}).get("last_results", [])
+        return [TargetResult(r["target"], [Vuln(**v) for v in r["vulns"]], r.get("error")) for r in raw]
 
 
 def format_results(results: list[TargetResult], title: str, max_per_target: int = 15) -> str:
@@ -171,6 +185,5 @@ def format_results(results: list[TargetResult], title: str, max_per_target: int 
             lines.append(f"   … et {len(ordered) - max_per_target} autre(s) paquet(s)")
     if any(r.vulns for r in results):
         lines.append("")
-        lines.append("💡 Hôte : <code>apt update &amp;&amp; apt upgrade</code> — "
-                     "Images : mettre à jour l'image puis <code>docker compose pull &amp;&amp; up -d</code>")
+        lines.append("💡 /fix pour le correctif détaillé de chaque projet")
     return "\n".join(lines)

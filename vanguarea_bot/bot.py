@@ -13,7 +13,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, Defaults, filters
 
 from . import __version__
-from .checks import cve, docker_check, integrity, network, ssh, system, web
+from .checks import cve, docker_check, integrity, network, remedy, ssh, system, web
 from .config import Config, load_config
 from .state import WARNING, Alert, AlertManager, State
 from .utils import chunk_message, esc, human_duration
@@ -28,6 +28,7 @@ COMMANDS = [
     ("ports", "Ports en écoute"),
     ("updates", "Mises à jour disponibles"),
     ("cve", "Lancer un scan des CVE (paquets + images)"),
+    ("fix", "Correctifs à appliquer pour les CVE (ex : /fix monprojet)"),
     ("report", "Rapport complet"),
     ("mute", "Couper les alertes (ex : /mute 60)"),
     ("unmute", "Réactiver les alertes"),
@@ -113,12 +114,22 @@ class Monitor:
             duration = human_duration(time.time() - started)
             errors = [r for r in results if r.error]
             if scheduled:
-                # Planifié : on ne remonte que les nouvelles CVE (et les erreurs).
+                # Planifié : on ne remonte que les nouvelles CVE (et les erreurs), avec leurs correctifs.
                 if new or errors:
                     await self.broadcast(app, cve.format_results(new + errors, "Nouvelles CVE détectées"))
+                for block in (await self.fix_advice(new) if new else []):
+                    await self.broadcast(app, block)
             else:
                 text = cve.format_results(results, "Scan des CVE") + f"\n\n⏱ Durée : {duration}"
                 await self.reply(update, text)
+
+    async def fix_advice(self, results: list[cve.TargetResult], project: str | None = None) -> list[str]:
+        try:
+            contexts = await asyncio.to_thread(docker_check.image_contexts, self.cfg)
+        except Exception:  # noqa: BLE001 - sans Docker, on donne quand même les correctifs de l'hôte
+            log.exception("Contexte des images indisponible")
+            contexts = {}
+        return await asyncio.to_thread(remedy.advise, self.cfg, results, contexts, project)
 
     async def job_daily_report(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = await self.build_report()
@@ -239,6 +250,15 @@ class Monitor:
         await self.reply(update, "🔎 Scan des CVE lancé, cela peut prendre plusieurs minutes…")
         await self.scan_cve(context.application, scheduled=False, update=update)
 
+    async def cmd_fix(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        results = cve.last_results(self.state)
+        if not results:
+            await self.reply(update, "Aucun scan disponible : lancez d'abord /cve.")
+            return
+        project = context.args[0] if context.args else None
+        for block in await self.fix_advice(results, project):
+            await self.reply(update, block)
+
     async def cmd_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.reply(update, await self.build_report())
 
@@ -269,7 +289,7 @@ class Monitor:
         handlers = {
             "start": self.cmd_help, "help": self.cmd_help, "status": self.cmd_status,
             "docker": self.cmd_docker, "security": self.cmd_security, "network": self.cmd_network,
-            "ports": self.cmd_ports, "updates": self.cmd_updates, "cve": self.cmd_cve,
+            "ports": self.cmd_ports, "updates": self.cmd_updates, "cve": self.cmd_cve, "fix": self.cmd_fix,
             "report": self.cmd_report, "mute": self.cmd_mute, "unmute": self.cmd_unmute,
         }
         for name, callback in handlers.items():

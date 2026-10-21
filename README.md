@@ -8,7 +8,7 @@ Bot Telegram qui surveille un VPS (OS, conteneurs Docker, CVE, attaques) et vous
 |---|---|---|
 | **OS** | CPU, RAM, swap, charge, disques et inodes, uptime, services systemd en échec, redémarrage requis, mises à jour (apt/dnf) dont sécurité, processus zombies, comptes UID 0 suspects | ✅ (seuils configurables) |
 | **Docker** | État de chaque conteneur, healthcheck, redémarrages, OOM kill, CPU/RAM | ✅ arrêt anormal, *unhealthy*, boucle de redémarrage, OOM |
-| **CVE** | Paquets de l'hôte (OS + dépendances applicatives) et images Docker en cours d'exécution, via [Trivy](https://trivy.dev) | ✅ scan quotidien, seules les **nouvelles** CVE sont signalées |
+| **CVE** | Paquets de l'hôte (OS + dépendances applicatives) et images Docker en cours d'exécution, via [Trivy](https://trivy.dev) | ✅ scan quotidien, seules les **nouvelles** CVE sont signalées, **avec le correctif à appliquer** |
 | **SSH** | Échecs d'authentification par IP, brute force distribué, connexions réussies, échecs `sudo` | ✅ |
 | **DDoS / flood** | SYN flood (connexions `SYN_RECV` + SYN cookies du noyau), trop de connexions depuis une IP, débit / paquets entrants anormaux | ✅ |
 | **Web** | Logs d'accès nginx/Apache/Caddy/Traefik : flood HTTP par IP, scans de vulnérabilités (`/.env`, `wp-login.php`, `../`, Log4Shell, injections SQL…) | ✅ (si `ACCESS_LOGS` est renseigné) |
@@ -29,6 +29,7 @@ Les alertes « durables » (disque plein, conteneur arrêté…) sont répétée
 | `/ports` | Ports en écoute et processus associés |
 | `/updates` | Mises à jour disponibles (sécurité en premier) |
 | `/cve` | Lance un scan complet des CVE maintenant |
+| `/fix [projet]` | Correctifs exacts à appliquer pour les CVE du dernier scan |
 | `/report` | Rapport complet |
 | `/mute 60` / `/unmute` | Couper les alertes pendant une maintenance |
 
@@ -81,6 +82,19 @@ Toutes les options sont dans [`.env.example`](.env.example) avec leurs valeurs p
 - `ACCESS_LOGS=/var/log/nginx/access.log` pour activer la détection d'attaques web. Pour un reverse proxy en conteneur, activez ses logs d'accès dans un fichier monté sur l'hôte (Traefik : `accesslog.filePath`, format texte ou JSON).
 - `SSH_TRUSTED_IPS` pour ne pas être notifié de vos propres connexions SSH.
 - `DOCKER_IGNORE` pour les conteneurs ponctuels.
+
+## Corriger les CVE
+
+Le bot reste **en lecture seule** : il ne modifie jamais votre code ni vos conteneurs. Pour chaque faille, il vous envoie la marche à suivre :
+
+- **Serveur** : la commande `apt`/`dnf`/`apk` qui met à jour uniquement les paquets vulnérables, et un rappel de redémarrer si le noyau est concerné.
+- **Image construite par vos projets** (docker compose) : il retrouve le projet et son dossier grâce aux labels compose, puis indique :
+  - les paquets système à corriger : reconstruction avec `--pull`, ou version du `FROM` à monter ;
+  - les dépendances à mettre à jour : `npm install pkg@^x.y.z` (ou `overrides` pour les dépendances indirectes), lignes `requirements.txt`, `go get`, version de Go pour la stdlib ;
+  - les commandes `git commit`/`git push` et `docker compose build`/`up -d` du service concerné.
+- **Image tierce** (postgres, nginx…) : `docker compose pull` + `up -d`, ou monter le tag s'il est figé.
+
+La version proposée est la plus petite version corrigée dans la même version majeure, pour limiter les risques de régression.
 
 ## Ce que le bot peut et ne peut pas détecter
 

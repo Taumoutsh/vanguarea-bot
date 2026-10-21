@@ -103,6 +103,40 @@ def running_images(cfg: Config) -> list[str]:
         client.close()
 
 
+@dataclass
+class ImageContext:
+    """Où une image est utilisée : projet docker compose, service, dossier, construite localement ou non."""
+
+    ref: str
+    container: str
+    project: str | None
+    service: str | None
+    workdir: str | None
+    built: bool
+
+
+def image_contexts(cfg: Config) -> dict[str, list[ImageContext]]:
+    client = _client(cfg)
+    try:
+        out: dict[str, list[ImageContext]] = {}
+        for c in client.containers.list():
+            image = c.image
+            ref = image.tags[0] if image.tags else image.id
+            labels = c.labels or {}
+            out.setdefault(ref, []).append(ImageContext(
+                ref=ref,
+                container=c.name,
+                project=labels.get("com.docker.compose.project"),
+                service=labels.get("com.docker.compose.service"),
+                workdir=labels.get("com.docker.compose.project.working_dir"),
+                # Une image construite localement n'a pas de digest de registre.
+                built=not image.attrs.get("RepoDigests"),
+            ))
+        return out
+    finally:
+        client.close()
+
+
 def alerts(containers: list[ContainerInfo], cfg: Config, state: State) -> list[Alert]:
     out: list[Alert] = []
     with state.lock:
