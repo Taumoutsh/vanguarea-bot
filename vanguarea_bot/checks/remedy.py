@@ -60,7 +60,16 @@ def _fixes(vulns: list[Vuln]) -> dict[str, tuple[str, str, list[str]]]:
 
 
 def _code(cmd: str) -> str:
-    return f"<pre>{esc(cmd)}</pre>"
+    """Commande copiable : en code en ligne, un appui sur Telegram mobile copie toute la commande.
+
+    (Dans un bloc <pre>, la coloration syntaxique découpe la commande et l'appui ne copie qu'un mot.)
+    """
+    return f"▸ <code>{esc(cmd)}</code>"
+
+
+def _block(text: str) -> str:
+    """Contenu multi-ligne à coller dans un fichier (package.json, requirements.txt...)."""
+    return f"<pre>{esc(text)}</pre>"
 
 
 def _steps(cmds: list[str]) -> list[str]:
@@ -71,7 +80,7 @@ def _steps(cmds: list[str]) -> list[str]:
     """
     if len(cmds) == 1:
         return [_code(cmds[0])]
-    return ["📋 <i>Tout en une fois :</i>", _code(" && ".join(cmds)),
+    return ["📋 <i>Tout en une fois (appuyez pour copier) :</i>", _code(" && ".join(cmds)),
             "<i>ou une commande à la fois :</i>", *(_code(c) for c in cmds)]
 
 
@@ -205,12 +214,12 @@ def lang_advice(vulns: list[Vuln], workdir: Path | None, host_root: Path = Path(
             if indirect_fix:
                 overrides = json.dumps({p: f"^{t}" for p, (_, t, _) in sorted(indirect_fix.items())}, indent=2)
                 lines.append("Dépendances indirectes : ajouter dans <code>package.json</code> puis <code>npm install</code> :")
-                lines.append(_code(f'"overrides": {overrides}'))
+                lines.append(_block(f'"overrides": {overrides}'))
         elif eco == "pip" and fixes:
             req = _find_file(workdir, "requirements.txt") if workdir else None
             where = f"<code>{esc(_shown(req, host_root))}</code>" if req else "<code>requirements.txt</code> (ou pyproject.toml)"
             lines.append(f"<b>Python</b> : mettre à jour {where}")
-            lines.append(_code("\n".join(f"{p}>={t}" for p, (_, t, _) in sorted(fixes.items()))))
+            lines.append(_block("\n".join(f"{p}>={t}" for p, (_, t, _) in sorted(fixes.items()))))
         elif eco == "go" and fixes:
             lines += go_advice(eco_vulns, workdir, host_root)
         elif fixes:

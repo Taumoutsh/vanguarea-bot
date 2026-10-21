@@ -23,8 +23,8 @@ def test_host_apt_advice_and_kernel_reboot():
         vuln("linux-image-amd64", "6.1.1", "6.1.2", cls="os-pkgs", pkg_type="debian", cve_id="CVE-2"),
     ])
     text = remedy.advise_host(result, running_kernel="6.1.0-18-amd64")
-    assert "<pre>sudo apt-get install --only-upgrade -y linux-image-amd64 openssl</pre>" in text
-    assert "<pre>sudo apt-get update &amp;&amp; sudo apt-get install" in text  # tout en une ligne
+    assert "<code>sudo apt-get install --only-upgrade -y linux-image-amd64 openssl</code>" in text
+    assert "<code>sudo apt-get update &amp;&amp; sudo apt-get install" in text  # tout en une ligne
     assert "sudo reboot" in text
 
 
@@ -38,7 +38,7 @@ def test_versioned_kernel_packages_use_metapackage():
     ])
     text = remedy.advise_host(result, running_kernel="6.8.0-45-generic")
     # On ne demande jamais de mettre à jour le paquet versionné déjà installé...
-    assert "install --only-upgrade -y linux-headers-generic linux-image-generic</pre>" in text
+    assert "install --only-upgrade -y linux-headers-generic linux-image-generic</code>" in text
     assert "install --only-upgrade -y linux-image-6.8.0" not in text
     # ... et l'ancien noyau inutilisé est à supprimer.
     assert "autoremove --purge" in text
@@ -94,5 +94,5 @@ def test_own_go_project_single_go_get_and_roundtrip(tmp_path: Path):
     loaded = cve.last_results(State(tmp_path / "s.json"))
     ctx = ImageContext("svc", "svc-1", "monapp", "api", str(tmp_path), built=True)
     text = remedy.advise(Config(token="x", chat_ids=frozenset({1})), loaded, {"svc": [ctx]})[1]
-    assert "<pre>go get golang.org/x/crypto@v0.31.0 golang.org/x/net@v0.23.0</pre>" in text
+    assert "<code>go get golang.org/x/crypto@v0.31.0 golang.org/x/net@v0.23.0</code>" in text
     assert "golang:1.21.8" in text
