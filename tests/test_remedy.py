@@ -96,3 +96,26 @@ def test_own_go_project_single_go_get_and_roundtrip(tmp_path: Path):
     text = remedy.advise(Config(token="x", chat_ids=frozenset({1})), loaded, {"svc": [ctx]})[1]
     assert "<code>go get golang.org/x/crypto@v0.31.0 golang.org/x/net@v0.23.0</code>" in text
     assert "golang:1.21.8" in text
+
+
+def test_requirements_commands_edit_file_in_place(tmp_path: Path):
+    import subprocess
+
+    req = tmp_path / "requirements.txt"
+    req.write_text('Django==4.2.1\nurllib3[socks] ; python_version>="3.8"\npyyaml')
+    cmds = remedy.requirements_commands(req.read_text(), {"django": "4.2.16", "urllib3": "2.2.2",
+                                                          "jinja2": "3.1.4"}, str(req))
+    assert all("\n" not in c for c in cmds)  # une ligne par commande : copiable d'un appui
+    for cmd in cmds:
+        subprocess.run(cmd, shell=True, check=True)
+    assert req.read_text() == ('Django==4.2.16\nurllib3[socks]>=2.2.2 ; python_version>="3.8"\n'
+                               "pyyaml\njinja2>=3.1.4\n")
+
+
+def test_npm_overrides_as_single_line_command(tmp_path: Path):
+    (tmp_path / "package.json").write_text(json.dumps({"dependencies": {"express": "^4.17.0"}}))
+    lines = remedy.npm_advice({"express": ("4.17.0", "4.20.0", ["C1"]), "qs": ("6.5.0", "6.5.3", ["C2"])}, tmp_path)
+    text = "\n".join(lines)
+    assert "<pre>" not in text
+    assert "npm install express@^4.20.0" in text
+    assert "node -e" in text and '{"qs": "^6.5.3"}' in text

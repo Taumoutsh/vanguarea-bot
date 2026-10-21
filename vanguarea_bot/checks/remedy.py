@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 from collections import defaultdict
 from pathlib import Path
 
@@ -67,9 +68,6 @@ def _code(cmd: str) -> str:
     return f"▸ <code>{esc(cmd)}</code>"
 
 
-def _block(text: str) -> str:
-    """Contenu multi-ligne à coller dans un fichier (package.json, requirements.txt...)."""
-    return f"<pre>{esc(text)}</pre>"
 
 
 def _steps(cmds: list[str]) -> list[str]:
@@ -203,23 +201,9 @@ def lang_advice(vulns: list[Vuln], workdir: Path | None, host_root: Path = Path(
         fixes = _fixes(eco_vulns)
         unfixable = sorted({v.pkg for v in eco_vulns if v.pkg not in fixes})
         if eco == "npm" and fixes:
-            pkg_json = _find_file(workdir, "package.json") if workdir else None
-            direct = _npm_direct_deps(pkg_json)
-            where = f" (dans <code>{esc(_shown(pkg_json.parent, host_root))}</code>)" if pkg_json else ""
-            direct_fix = {p: f for p, f in fixes.items() if p in direct}
-            indirect_fix = {p: f for p, f in fixes.items() if p not in direct}
-            lines.append(f"<b>npm</b>{where}")
-            if direct_fix:
-                lines.append(_code("npm install " + " ".join(f"{p}@^{t}" for p, (_, t, _) in sorted(direct_fix.items()))))
-            if indirect_fix:
-                overrides = json.dumps({p: f"^{t}" for p, (_, t, _) in sorted(indirect_fix.items())}, indent=2)
-                lines.append("Dépendances indirectes : ajouter dans <code>package.json</code> puis <code>npm install</code> :")
-                lines.append(_block(f'"overrides": {overrides}'))
+            lines += npm_advice(fixes, workdir, host_root)
         elif eco == "pip" and fixes:
-            req = _find_file(workdir, "requirements.txt") if workdir else None
-            where = f"<code>{esc(_shown(req, host_root))}</code>" if req else "<code>requirements.txt</code> (ou pyproject.toml)"
-            lines.append(f"<b>Python</b> : mettre à jour {where}")
-            lines.append(_block("\n".join(f"{p}>={t}" for p, (_, t, _) in sorted(fixes.items()))))
+            lines += pip_advice(fixes, workdir, host_root)
         elif eco == "go" and fixes:
             lines += go_advice(eco_vulns, workdir, host_root)
         elif fixes:
@@ -228,6 +212,89 @@ def lang_advice(vulns: list[Vuln], workdir: Path | None, host_root: Path = Path(
         if unfixable:
             lines.append(f"⏳ Pas encore de correctif ({esc(eco)}) : {esc(', '.join(unfixable))}")
     return lines
+
+
+def _bullets(fixes: dict) -> list[str]:
+    return [f"• <code>{esc(p)}</code> {esc(i)} → <b>{esc(t)}</b>" for p, (i, t, _) in sorted(fixes.items())]
+
+
+def npm_advice(fixes: dict, workdir: Path | None, host_root: Path = Path("/")) -> list[str]:
+    """npm : « npm install » pour les dépendances directes, « overrides » pour les indirectes.
+
+    Les overrides sont écrits par une commande node d'une ligne plutôt qu'un bloc JSON à coller.
+    """
+    pkg_json = _find_file(workdir, "package.json") if workdir else None
+    direct = _npm_direct_deps(pkg_json)
+    direct_fix = {p: f for p, f in fixes.items() if p in direct}
+    indirect_fix = {p: f for p, f in fixes.items() if p not in direct}
+    folder = _shown(pkg_json.parent, host_root) if pkg_json else None
+    lines = ["<b>npm</b>" + (f" (dans <code>{esc(folder)}</code>)" if folder else ""), *_bullets(fixes)]
+    cmds = [f"cd {shlex.quote(folder)}"] if folder else []
+    if direct_fix:
+        cmds.append("npm install " + " ".join(f"{p}@^{t}" for p, (_, t, _) in sorted(direct_fix.items())))
+    if indirect_fix:
+        overrides = json.dumps({p: f"^{t}" for p, (_, t, _) in sorted(indirect_fix.items())})
+        cmds.append(
+            "node -e " + shlex.quote(
+                'const fs=require("fs");const p=JSON.parse(fs.readFileSync("package.json"));'
+                f"p.overrides={{...p.overrides,...{overrides}}};"
+                'fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\\n")'
+            )
+        )
+        cmds.append("npm install")
+        lines.append("<i>Dépendances indirectes : ajout d'« overrides » dans package.json.</i>")
+    return lines + _steps(cmds)
+
+
+def _norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+REQ_LINE = re.compile(r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)(?P<extras>\[[^\]]*\])?\s*(?P<spec>[^;#]*)(?P<rest>.*)$")
+SED_REGEX_SPECIAL = re.compile(r"([\\/.*\[\]^$])")
+
+
+def requirements_commands(content: str, fixes: dict[str, str], path: str) -> list[str]:
+    """Commandes d'une ligne qui mettent à jour un requirements.txt (sed / printf), sans copier de bloc."""
+    wanted = {_norm(p): (p, v) for p, v in fixes.items()}
+    cmds: list[str] = []
+    done: set[str] = set()
+    for raw in content.splitlines():
+        line = raw.rstrip("\r")
+        if not line.strip() or line.lstrip().startswith(("#", "-")):
+            continue
+        m = REQ_LINE.match(line)
+        if not m or _norm(m["name"]) not in wanted or _norm(m["name"]) in done:
+            continue
+        _, version = wanted[_norm(m["name"])]
+        op = "==" if "==" in m["spec"] else ">="
+        rest = m["rest"].strip()
+        new = f"{m['name']}{m['extras'] or ''}{op}{version}" + (f" {rest}" if rest else "")
+        done.add(_norm(m["name"]))
+        old_re = SED_REGEX_SPECIAL.sub(r"\\\1", line)
+        new_repl = re.sub(r"([\\/&])", r"\\\1", new)
+        cmds.append(f"sed -i {shlex.quote(f's/^{old_re}\\r\\?$/{new_repl}/')} {shlex.quote(path)}")
+    missing = [f"{p}>={v}" for key, (p, v) in sorted(wanted.items()) if key not in done]
+    for i, req in enumerate(missing):
+        # Si le fichier ne finit pas par un retour à la ligne, on en ajoute un avant la première ligne.
+        fmt = "\\n%s\\n" if i == 0 and content and not content.endswith("\n") else "%s\\n"
+        cmds.append(f"printf '{fmt}' {shlex.quote(req)} >> {shlex.quote(path)}")
+    return cmds
+
+
+def pip_advice(fixes: dict, workdir: Path | None, host_root: Path = Path("/")) -> list[str]:
+    req = _find_file(workdir, "requirements.txt") if workdir else None
+    if not req:
+        return ["<b>Python</b> : mettre à jour dans <code>requirements.txt</code> ou <code>pyproject.toml</code>",
+                *_bullets(fixes)]
+    shown = _shown(req, host_root)
+    try:
+        content = req.read_text(errors="replace")
+    except OSError:
+        content = ""
+    targets = {p: t for p, (_, t, _) in fixes.items()}
+    return [f"<b>Python</b> : mise à jour de <code>{esc(shown)}</code>", *_bullets(fixes),
+            *_steps(requirements_commands(content, targets, shown))]
 
 
 def _go_module(workdir: Path | None) -> tuple[Path | None, str | None]:
