@@ -119,3 +119,49 @@ def test_npm_overrides_as_single_line_command(tmp_path: Path):
     assert "<pre>" not in text
     assert "npm install express@^4.20.0" in text
     assert "node -e" in text and '{"qs": "^6.5.3"}' in text
+
+
+def _assert_balanced_html(text: str):
+    from html.parser import HTMLParser
+
+    class Checker(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.stack = []
+
+        def handle_starttag(self, tag, attrs):
+            self.stack.append(tag)
+
+        def handle_endtag(self, tag):
+            assert self.stack and self.stack.pop() == tag, f"balise </{tag}> mal fermée"
+
+    checker = Checker()
+    checker.feed(text)
+    assert checker.stack == [], f"balises non fermées : {checker.stack}"
+
+
+def test_third_party_image_readable_and_tag_aware():
+    cfg = Config(token="x", chat_ids=frozenset({1}))
+    ctx = ImageContext("jc21/nginx-proxy-manager:latest", "npm-1", "proxy_manager", "npm",
+                       "/home/ubuntu/proxy_manager", built=False)
+    result = cve.TargetResult(ctx.ref, [vuln("libexpat", "2.8.5-r0", "2.9.0-r0", cls="os-pkgs", pkg_type="alpine")])
+    text = remedy.advise(cfg, [result], {ctx.ref: [ctx]})[1]
+    _assert_balanced_html(text)
+    assert "CVE-2026" not in text  # évite les faux liens « numéro de téléphone » de Telegram
+    assert "pas encore publié" in text and "figée" not in text
+    # une seule commande visible, le détail est replié
+    assert text.count("<blockquote expandable>") == 1
+    assert "<code>cd /home/ubuntu/proxy_manager &amp;&amp; docker compose pull npm" in text
+    assert remedy._tag("postgres:16") == "16" and remedy._tag("sha256:abc") is None
+
+
+def test_chunk_message_never_splits_blockquote():
+    from vanguarea_bot.utils import chunk_message, copy_steps
+
+    block = "\n".join(copy_steps([f"commande-{i} " + "x" * 50 for i in range(10)]))
+    text = "\n".join([block] * 20)
+    chunks = chunk_message(text, limit=1500)
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert chunk.count("<blockquote") == chunk.count("</blockquote>")
+        _assert_balanced_html(chunk)

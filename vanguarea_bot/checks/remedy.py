@@ -121,8 +121,7 @@ def _npm_direct_deps(package_json: Path | None) -> set[str]:
 
 
 def os_package_advice(pkg_type: str, fixes: dict, in_image: bool, running_kernel: str = "") -> list[str]:
-    lines = [f"• <code>{esc(pkg)}</code> {esc(installed)} → <b>{esc(target)}</b> ({esc(', '.join(cves[:3]))})"
-             for pkg, (installed, target, cves) in sorted(fixes.items())]
+    lines = _bullets(fixes)
     if in_image:
         return lines
 
@@ -147,14 +146,12 @@ def os_package_advice(pkg_type: str, fixes: dict, in_image: bool, running_kernel
     else:
         cmds = []
     if cmds:
-        lines.append("<b>Mettre à jour</b>")
-        lines += _steps(cmds)
+        lines += ["", "🔧 <b>Mettre à jour</b>", *_steps(cmds)]
     if old_kernels:
-        lines.append(f"<b>Anciens noyaux inutilisés</b> ({esc(', '.join(old_kernels))}) : à supprimer")
-        lines += _steps(["sudo apt-get autoremove --purge -y"])
+        lines += ["", f"🗑 <b>Anciens noyaux inutilisés</b> : {esc(', '.join(old_kernels))}",
+                  *_steps(["sudo apt-get autoremove --purge -y"])]
     if kernel_update:
-        lines.append("🔁 Nouveau noyau : redémarrer ensuite le serveur pour l'utiliser")
-        lines += _steps(["sudo reboot"])
+        lines += ["", "🔁 <b>Nouveau noyau</b> : redémarrer ensuite le serveur", *_steps(["sudo reboot"])]
     return lines
 
 
@@ -185,15 +182,19 @@ def lang_advice(vulns: list[Vuln], workdir: Path | None, host_root: Path = Path(
         elif eco == "go" and fixes:
             lines += go_advice(eco_vulns, workdir, host_root)
         elif fixes:
-            lines.append(f"<b>{esc(eco)}</b>")
-            lines += [f"• <code>{esc(p)}</code> {esc(i)} → <b>{esc(t)}</b>" for p, (i, t, _) in sorted(fixes.items())]
+            lines += ["", f"📦 <b>{esc(eco)}</b>", *_bullets(fixes)]
         if unfixable:
             lines.append(f"⏳ Pas encore de correctif ({esc(eco)}) : {esc(', '.join(unfixable))}")
     return lines
 
 
-def _bullets(fixes: dict) -> list[str]:
-    return [f"• <code>{esc(p)}</code> {esc(i)} → <b>{esc(t)}</b>" for p, (i, t, _) in sorted(fixes.items())]
+def _bullets(fixes: dict, limit: int = 6) -> list[str]:
+    """Paquets à mettre à jour (les premiers seulement, pour rester lisible)."""
+    items = sorted(fixes.items())
+    lines = [f"• <code>{esc(p)}</code> {esc(i)} → <b>{esc(t)}</b>" for p, (i, t, _) in items[:limit]]
+    if len(items) > limit:
+        lines.append(f"• … et {len(items) - limit} autre(s) paquet(s)")
+    return lines
 
 
 def npm_advice(fixes: dict, workdir: Path | None, host_root: Path = Path("/")) -> list[str]:
@@ -206,7 +207,7 @@ def npm_advice(fixes: dict, workdir: Path | None, host_root: Path = Path("/")) -
     direct_fix = {p: f for p, f in fixes.items() if p in direct}
     indirect_fix = {p: f for p, f in fixes.items() if p not in direct}
     folder = _shown(pkg_json.parent, host_root) if pkg_json else None
-    lines = ["<b>npm</b>" + (f" (dans <code>{esc(folder)}</code>)" if folder else ""), *_bullets(fixes)]
+    lines = ["", "📦 <b>npm</b>" + (f" — <code>{esc(folder)}</code>" if folder else ""), *_bullets(fixes)]
     cmds = [f"cd {shlex.quote(folder)}"] if folder else []
     if direct_fix:
         cmds.append("npm install " + " ".join(f"{p}@^{t}" for p, (_, t, _) in sorted(direct_fix.items())))
@@ -221,6 +222,7 @@ def npm_advice(fixes: dict, workdir: Path | None, host_root: Path = Path("/")) -
         )
         cmds.append("npm install")
         lines.append("<i>Dépendances indirectes : ajout d'« overrides » dans package.json.</i>")
+    lines.append("🔧 <b>Mettre à jour</b>")
     return lines + _steps(cmds)
 
 
@@ -263,7 +265,7 @@ def requirements_commands(content: str, fixes: dict[str, str], path: str) -> lis
 def pip_advice(fixes: dict, workdir: Path | None, host_root: Path = Path("/")) -> list[str]:
     req = _find_file(workdir, "requirements.txt") if workdir else None
     if not req:
-        return ["<b>Python</b> : mettre à jour dans <code>requirements.txt</code> ou <code>pyproject.toml</code>",
+        return ["", "📦 <b>Python</b> — à mettre à jour dans <code>requirements.txt</code> ou <code>pyproject.toml</code>",
                 *_bullets(fixes)]
     shown = _shown(req, host_root)
     try:
@@ -271,7 +273,7 @@ def pip_advice(fixes: dict, workdir: Path | None, host_root: Path = Path("/")) -
     except OSError:
         content = ""
     targets = {p: t for p, (_, t, _) in fixes.items()}
-    return [f"<b>Python</b> : mise à jour de <code>{esc(shown)}</code>", *_bullets(fixes),
+    return ["", f"📦 <b>Python</b> — <code>{esc(shown)}</code>", *_bullets(fixes), "🔧 <b>Mettre à jour</b>",
             *_steps(requirements_commands(content, targets, shown))]
 
 
@@ -305,7 +307,7 @@ def go_advice(vulns: list[Vuln], workdir: Path | None, host_root: Path = Path("/
         name = binary.rstrip("/").rsplit("/", 1)[-1]
         fixes = _fixes(bvulns)
         main = next((p for p in fixes if p.rstrip("/").rsplit("/", 1)[-1] == name), None)
-        lines.append(f"<b>Binaire tiers</b> <code>/{esc(binary.lstrip('/'))}</code> : {len(bvulns)} CVE")
+        lines += ["", f"📦 <b>Binaire tiers</b> <code>/{esc(binary.lstrip('/'))}</code> — {len(bvulns)} CVE"]
         if main:
             lines.append(f"→ Mettre à jour <b>{esc(name)}</b> en version ≥ <b>{esc(fixes[main][1])}</b> "
                          f"(actuellement {esc(fixes[main][0])}), ex. le tag de l'image dans "
@@ -317,14 +319,14 @@ def go_advice(vulns: list[Vuln], workdir: Path | None, host_root: Path = Path("/
         fixes = _fixes(own)
         stdlib = fixes.pop("stdlib", None)
         if fixes:
-            where = f" (dans <code>{esc(_shown(go_mod.parent, host_root))}</code>)" if go_mod else ""
-            lines.append(f"<b>Go</b>{where}")
+            where = f" — <code>{esc(_shown(go_mod.parent, host_root))}</code>" if go_mod else ""
+            lines += ["", f"📦 <b>Go</b>{where}", "🔧 <b>Mettre à jour</b>"]
             cmds = ([f"cd {_shown(go_mod.parent, host_root)}"] if go_mod else [])
             cmds += ["go get " + " ".join(f"{p}@v{t.lstrip('v')}" for p, (_, t, _) in sorted(fixes.items())),
                      "go mod tidy"]
             lines += _steps(cmds)
         if stdlib:
-            lines.append(f"<b>Go stdlib</b> : compiler avec Go ≥ <b>{esc(stdlib[1])}</b> "
+            lines.append(f"📦 <b>Go stdlib</b> : compiler avec Go ≥ <b>{esc(stdlib[1])}</b> "
                          f"(ex. <code>FROM golang:{esc(stdlib[1])}</code> dans le Dockerfile)")
     return lines
 
@@ -343,18 +345,26 @@ def advise_host(result: TargetResult, running_kernel: str | None = None) -> str:
                 lines += os_package_advice(pkg_type, fixes, in_image=False,
                                            running_kernel=running_kernel or os.uname().release)
     if lang_vulns:
-        lines.append("Dépendances applicatives installées sur le serveur :")
+        lines += ["", "📦 <b>Dépendances applicatives installées sur le serveur</b>"]
         for v in lang_vulns:
             lines.append(f"• <code>{esc(v.pkg)}</code> {esc(v.installed)} → <b>{esc(v.fixed or '?')}</b> "
                          f"— <code>{esc(v.path)}</code>")
     return "\n".join(lines)
 
 
+def _tag(ref: str) -> str | None:
+    """Tag d'une référence d'image (« latest » pour « nginx:latest »), None si c'est un ID."""
+    if ref.startswith("sha256:"):
+        return None
+    name = ref.rsplit("/", 1)[-1]
+    return name.split(":", 1)[1] if ":" in name else "latest"
+
+
 def advise_image(cfg: Config, result: TargetResult, contexts: list[ImageContext]) -> str:
     ctx = contexts[0] if contexts else None
     services = sorted({c.service for c in contexts if c.service})
     label = f"{ctx.project} / {', '.join(services)}" if ctx and ctx.project else result.target
-    lines = [f"🐳 <b>{esc(label)}</b> — <i>{esc(result.target)}</i>"]
+    lines = [f"🐳 <b>{esc(label)}</b>", f"<i>{esc(result.target)}</i>"]
 
     os_vulns = [v for v in result.vulns if v.cls == "os-pkgs"]
     lang_vulns = [v for v in result.vulns if v.cls != "os-pkgs"]
@@ -363,32 +373,37 @@ def advise_image(cfg: Config, result: TargetResult, contexts: list[ImageContext]
 
     if ctx and not ctx.built:
         # Image tierce (postgres, nginx, redis...) : il faut une version plus récente de l'image.
-        lines.append(f"Image tierce : {len(result.vulns)} CVE corrigée(s) dans une version plus récente.")
+        n = len(result.vulns)
+        lines += ["", f"Image tierce — <b>{n} CVE</b> corrigée{'s' if n > 1 else ''} dans une version plus récente.",
+                  "", "🔧 <b>Mettre à jour</b>"]
         if ctx.project:
             lines += _steps([f"cd {ctx.workdir}", f"docker compose pull {svc}", f"docker compose up -d {svc}"])
         else:
             lines += _steps([f"docker pull {result.target}"])
             lines.append(f"puis recréer le conteneur <code>{esc(ctx.container)}</code>.")
-        lines.append("Si la CVE persiste après le pull, le tag est figé : passez à une version plus récente "
-                     "de l'image dans votre docker-compose.yml.")
+        if _tag(result.target) == "latest":
+            lines.append("<i>Si les CVE persistent après la mise à jour, l'éditeur n'a pas encore publié "
+                         "d'image corrigée : réessayez plus tard.</i>")
+        else:
+            lines.append("<i>Si les CVE persistent après la mise à jour, la version est figée par le tag : "
+                         "montez-la dans le docker-compose.yml.</i>")
         return "\n".join(lines)
 
     if os_vulns:
         by_type: dict[str, list[Vuln]] = defaultdict(list)
         for v in os_vulns:
             by_type[v.pkg_type].append(v)
-        lines.append("<b>Paquets système de l'image</b>")
+        lines += ["", "📦 <b>Paquets système de l'image</b>"]
         for pkg_type, vulns in by_type.items():
             fixes = _fixes(vulns)
             if fixes:
                 lines += os_package_advice(pkg_type, fixes, in_image=True)
-        lines.append("→ Reconstruire en récupérant l'image de base à jour. Si ça ne suffit pas, "
-                     "monter la version du <code>FROM</code> du Dockerfile (image de base obsolète).")
+        lines.append("<i>Corrigés en reconstruisant l'image (ci-dessous). Si ça ne suffit pas, montez la "
+                     "version du FROM du Dockerfile.</i>")
     if lang_vulns:
         lines += lang_advice(lang_vulns, workdir, cfg.host_root)
 
-    lines.append("")
-    lines.append("<b>Puis redéployer</b>")
+    lines += ["", "🚀 <b>Redéployer</b>"]
     steps = [f"cd {ctx.workdir}"] if ctx and ctx.workdir else []
     if lang_vulns:
         steps += ['git commit -am "fix(security): mise à jour des dépendances vulnérables"', "git push"]
@@ -420,5 +435,8 @@ def advise(cfg: Config, results: list[TargetResult], contexts: dict[str, list[Im
         blocks.append(advise_image(cfg, r, ctxs))
     if not blocks:
         return ["✅ Aucun correctif à appliquer" + (f" pour <b>{esc(project)}</b>." if project else ".")]
-    header = "🛠 <b>Correctifs à appliquer</b>\n<i>Vérifiez puis testez chaque changement avant de le déployer.</i>"
+    header = ("🛠 <b>Correctifs à appliquer</b>\n\n"
+              "👆 Appuyez sur une commande pour la copier.\n"
+              "▸ La ligne affichée lance tout d'un coup ; « Commande par commande » (à déplier) les détaille.\n"
+              "<i>Vérifiez puis testez chaque changement avant de le déployer.</i>")
     return [header, *blocks]

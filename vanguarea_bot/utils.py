@@ -63,15 +63,15 @@ def copy_cmd(cmd: str) -> str:
 
 
 def copy_steps(cmds: list[str]) -> list[str]:
-    """Commandes à copier : d'un bloc (une seule ligne, s'arrête à la première erreur) ou une par une.
+    """Commandes à copier : toutes sur une ligne (s'arrête à la première erreur), et le détail
+    commande par commande replié dans un bloc dépliable pour garder le message lisible.
 
-    Chaque commande est dans son propre bloc pour que le bouton « copier » de Telegram
-    ne prenne qu'elle : un collage multi-ligne dans un terminal SSH est peu fiable.
+    Chaque commande est sur sa propre ligne en code en ligne : un appui la copie en entier.
     """
     if len(cmds) == 1:
         return [copy_cmd(cmds[0])]
-    return ["📋 <i>Tout en une fois (appuyez pour copier) :</i>", copy_cmd(" && ".join(cmds)),
-            "<i>ou une commande à la fois :</i>", *(copy_cmd(c) for c in cmds)]
+    detail = "\n".join(["<i>Commande par commande :</i>", *(copy_cmd(c) for c in cmds)])
+    return [copy_cmd(" && ".join(cmds)), f"<blockquote expandable>{detail}</blockquote>"]
 
 
 def human_bytes(num: float) -> str:
@@ -109,23 +109,42 @@ def level_icon(percent: float, warn: float) -> str:
     return "🟢"
 
 
+def _units(text: str) -> list[str]:
+    """Lignes du message, un bloc <blockquote> comptant pour une seule unité (jamais coupé en deux)."""
+    units: list[str] = []
+    current: list[str] | None = None
+    for line in text.split("\n"):
+        if current is not None:
+            current.append(line)
+            if "</blockquote>" in line:
+                units.append("\n".join(current))
+                current = None
+        elif "<blockquote" in line and "</blockquote>" not in line:
+            current = [line]
+        else:
+            units.append(line)
+    if current is not None:
+        units.append("\n".join(current))
+    return units
+
+
 def chunk_message(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
-    """Découpe un message en morceaux compatibles avec la limite Telegram."""
+    """Découpe un message en morceaux compatibles avec la limite Telegram (sans casser le HTML des citations)."""
     if len(text) <= limit:
         return [text]
     chunks: list[str] = []
     current = ""
-    for line in text.split("\n"):
-        while len(line) > limit:
+    for unit in _units(text):
+        while len(unit) > limit:
             if current:
                 chunks.append(current)
                 current = ""
-            chunks.append(line[:limit])
-            line = line[limit:]
-        candidate = f"{current}\n{line}" if current else line
+            chunks.append(unit[:limit])
+            unit = unit[limit:]
+        candidate = f"{current}\n{unit}" if current else unit
         if len(candidate) > limit:
             chunks.append(current)
-            current = line
+            current = unit
         else:
             current = candidate
     if current:
