@@ -23,6 +23,9 @@ def fake_host(tmp_path: Path) -> Config:
     # Extensions : deux versions de la même
     make(home / ".vscode-server/extensions/golang.go-0.40.0/package.json")
     make(home / ".vscode-server/extensions/golang.go-0.42.1/package.json")
+    # SDK de l'extension Claude : deux versions en cache
+    make(home / ".vscode-server/data/agent-host/sdk-cache/claude/0.3.220/linux-x64/x", age=86400)
+    make(home / ".vscode-server/data/agent-host/sdk-cache/claude/0.3.300/linux-x64/x", age=0)
     # Caches GoLand de deux versions + backend distant
     make(home / ".cache/JetBrains/GoLand2024.3/index/x")
     make(home / ".cache/JetBrains/GoLand2025.2/index/x")
@@ -49,6 +52,7 @@ def test_editor_items_keep_newest_and_running(tmp_path, monkeypatch):
     assert "golang.go-0.40.0" in text and "golang.go-0.42.1" not in text
     assert "GoLand2024.3" in text and "GoLand2025.2" not in text
     assert "111_GoLand-2024.3" in text and "222_GoLand" not in text
+    assert "sdk-cache/claude/0.3.220" in text and "0.3.300" not in text
     assert str(tmp_path) not in text  # chemins affichés tels que vus depuis l'hôte
 
 

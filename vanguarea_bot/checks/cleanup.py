@@ -135,6 +135,12 @@ def editor_items(cfg: Config, running: str) -> list[Item]:
             entries = [Path(p) for p in glob.glob(str(home / pattern))]
             old_by_title.setdefault(title, []).extend(_old_versions(cfg, entries, running))
 
+        # SDK téléchargés par des extensions (ex. agent-host/sdk-cache/claude/<version>) : une liste par SDK.
+        for sdk in sorted(glob.glob(str(home / ".vscode-server/data/agent-host/sdk-cache/*"))):
+            entries = [Path(p) for p in glob.glob(f"{sdk}/*") if Path(p).is_dir()]
+            old_by_title.setdefault("SDK en cache des extensions VS Code", []).extend(
+                _old_versions(cfg, entries, running))
+
         for ext_dir in EXTENSION_DIRS:
             groups: dict[str, list[Path]] = {}
             for p in (home / ext_dir).glob("*"):
