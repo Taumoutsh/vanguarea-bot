@@ -10,7 +10,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from ..config import Config
-from ..utils import esc
+from ..utils import copy_steps as _steps, esc
 from .cve import TargetResult, Vuln
 from .docker_check import ImageContext
 
@@ -58,28 +58,6 @@ def _fixes(vulns: list[Vuln]) -> dict[str, tuple[str, str, list[str]]]:
         else:
             out[v.pkg] = (v.installed, target, [v.cve])
     return out
-
-
-def _code(cmd: str) -> str:
-    """Commande copiable : en code en ligne, un appui sur Telegram mobile copie toute la commande.
-
-    (Dans un bloc <pre>, la coloration syntaxique découpe la commande et l'appui ne copie qu'un mot.)
-    """
-    return f"▸ <code>{esc(cmd)}</code>"
-
-
-
-
-def _steps(cmds: list[str]) -> list[str]:
-    """Commandes à copier : d'un bloc (une seule ligne, s'arrête à la première erreur) ou une par une.
-
-    Chaque commande est dans son propre bloc pour que le bouton « copier » de Telegram
-    ne prenne qu'elle : un collage multi-ligne dans un terminal SSH est peu fiable.
-    """
-    if len(cmds) == 1:
-        return [_code(cmds[0])]
-    return ["📋 <i>Tout en une fois (appuyez pour copier) :</i>", _code(" && ".join(cmds)),
-            "<i>ou une commande à la fois :</i>", *(_code(c) for c in cmds)]
 
 
 # Paquet noyau dont le nom contient la version : linux-image-6.8.0-45-generic, linux-headers-6.1.0-18-amd64...

@@ -199,7 +199,8 @@ def alerts(status: SystemStatus, cfg: Config) -> list[Alert]:
         if d.percent >= cfg.disk_threshold:
             out.append(Alert(f"sys:disk:{d.mountpoint}", CRITICAL if d.percent >= 95 else WARNING,
                              f"Disque {d.mountpoint} rempli à {d.percent:.0f}%",
-                             f"{human_bytes(d.used)} / {human_bytes(d.total)} ({esc(d.device)})"))
+                             f"{human_bytes(d.used)} / {human_bytes(d.total)} ({esc(d.device)})\n"
+                             "💡 /cleanup pour voir ce qui peut être supprimé"))
         if d.inode_percent >= cfg.inode_threshold:
             out.append(Alert(f"sys:inode:{d.mountpoint}", WARNING,
                              f"Inodes {d.mountpoint} utilisés à {d.inode_percent:.0f}%"))

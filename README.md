@@ -28,6 +28,7 @@ Les alertes « durables » (disque plein, conteneur arrêté…) sont répétée
 | `/network` | Trafic, connexions, top IP connectées |
 | `/ports` | Ports en écoute et processus associés |
 | `/updates` | Mises à jour disponibles (sécurité en premier) |
+| `/cleanup` | Espace disque récupérable et commandes de nettoyage |
 | `/cve` | Lance un scan complet des CVE maintenant |
 | `/fix [projet]` | Correctifs exacts à appliquer pour les CVE du dernier scan |
 | `/report` | Rapport complet |
@@ -95,6 +96,13 @@ Le bot reste **en lecture seule** : il ne modifie jamais votre code ni vos conte
 - **Image tierce** (postgres, nginx…) : `docker compose pull` + `up -d`, ou monter le tag s'il est figé.
 
 La version proposée est la plus petite version corrigée dans la même version majeure, pour limiter les risques de régression.
+
+## Libérer de l'espace disque
+
+`/cleanup` (également rappelé dans l'alerte « disque plein » et dans le rapport quotidien au-delà de 1 Go) liste ce qui peut être supprimé, avec la commande correspondante. Le bot ne supprime rien lui-même.
+
+- **Sans risque** : anciennes versions de VS Code Server / CLI, Cursor, backends JetBrains (GoLand, IntelliJ…) et caches d'anciennes versions, anciennes versions d'extensions (la version la plus récente et celles en cours d'utilisation sont toujours conservées), caches Go / npm / pip / Yarn, images Docker inutilisées, cache de build Docker, cache apt, paquets apt orphelins, anciennes révisions snap, journaux systemd au-delà de 200 Mo.
+- **À vérifier** (jamais inclus dans la commande « tout en une fois ») : conteneurs arrêtés, volumes Docker non utilisés (ils contiennent des données !), logs de conteneurs volumineux, anciens logs archivés.
 
 ## Ce que le bot peut et ne peut pas détecter
 

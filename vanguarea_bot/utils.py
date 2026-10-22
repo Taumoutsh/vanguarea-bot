@@ -54,6 +54,26 @@ def esc(value: object) -> str:
     return html.escape(str(value), quote=False)
 
 
+def copy_cmd(cmd: str) -> str:
+    """Commande copiable : en code en ligne, un appui sur Telegram mobile copie toute la commande.
+
+    (Dans un bloc <pre>, la coloration syntaxique découpe la commande et l'appui ne copie qu'un mot.)
+    """
+    return f"▸ <code>{esc(cmd)}</code>"
+
+
+def copy_steps(cmds: list[str]) -> list[str]:
+    """Commandes à copier : d'un bloc (une seule ligne, s'arrête à la première erreur) ou une par une.
+
+    Chaque commande est dans son propre bloc pour que le bouton « copier » de Telegram
+    ne prenne qu'elle : un collage multi-ligne dans un terminal SSH est peu fiable.
+    """
+    if len(cmds) == 1:
+        return [copy_cmd(cmds[0])]
+    return ["📋 <i>Tout en une fois (appuyez pour copier) :</i>", copy_cmd(" && ".join(cmds)),
+            "<i>ou une commande à la fois :</i>", *(copy_cmd(c) for c in cmds)]
+
+
 def human_bytes(num: float) -> str:
     for unit in ("o", "Ko", "Mo", "Go", "To"):
         if abs(num) < 1024:

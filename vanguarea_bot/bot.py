@@ -13,10 +13,10 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, Defaults, filters
 
 from . import __version__
-from .checks import cve, docker_check, integrity, network, remedy, ssh, system, web
+from .checks import cleanup, cve, docker_check, integrity, network, remedy, ssh, system, web
 from .config import Config, load_config
 from .state import WARNING, Alert, AlertManager, State
-from .utils import chunk_message, esc, human_duration
+from .utils import chunk_message, esc, human_bytes, human_duration
 
 log = logging.getLogger("vanguarea")
 
@@ -27,6 +27,7 @@ COMMANDS = [
     ("network", "Connexions et trafic réseau"),
     ("ports", "Ports en écoute"),
     ("updates", "Mises à jour disponibles"),
+    ("cleanup", "Espace disque récupérable et commandes de nettoyage"),
     ("cve", "Lancer un scan des CVE (paquets + images)"),
     ("fix", "Correctifs à appliquer pour les CVE (ex : /fix monprojet)"),
     ("report", "Rapport complet"),
@@ -193,6 +194,11 @@ class Monitor:
             parts.append(line)
         except Exception as exc:  # noqa: BLE001
             parts.append(f"🐳 Docker : indisponible ({esc(exc)})")
+        items = await asyncio.to_thread(cleanup.collect, cfg)
+        total, safe = cleanup.reclaimable(items)
+        if safe >= 1024 ** 3:
+            parts.append(f"🧹 <b>{human_bytes(safe)}</b> récupérables sans risque "
+                         f"({human_bytes(total)} au total) : /cleanup")
         parts.append(await asyncio.to_thread(self.security_summary))
         parts.append(self.cve_summary())
         return "\n\n".join(parts)
@@ -250,6 +256,11 @@ class Monitor:
         await self.reply(update, "🔎 Scan des CVE lancé, cela peut prendre plusieurs minutes…")
         await self.scan_cve(context.application, scheduled=False, update=update)
 
+    async def cmd_cleanup(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self.reply(update, "🔎 Analyse de l'espace disque…")
+        items = await asyncio.to_thread(cleanup.collect, self.cfg)
+        await self.reply(update, cleanup.format_cleanup(items))
+
     async def cmd_fix(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         results = cve.last_results(self.state)
         if not results:
@@ -290,6 +301,7 @@ class Monitor:
             "start": self.cmd_help, "help": self.cmd_help, "status": self.cmd_status,
             "docker": self.cmd_docker, "security": self.cmd_security, "network": self.cmd_network,
             "ports": self.cmd_ports, "updates": self.cmd_updates, "cve": self.cmd_cve, "fix": self.cmd_fix,
+            "cleanup": self.cmd_cleanup,
             "report": self.cmd_report, "mute": self.cmd_mute, "unmute": self.cmd_unmute,
         }
         for name, callback in handlers.items():
