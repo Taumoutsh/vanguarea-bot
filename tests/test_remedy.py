@@ -40,9 +40,29 @@ def test_versioned_kernel_packages_use_metapackage():
     # On ne demande jamais de mettre à jour le paquet versionné déjà installé...
     assert "install --only-upgrade -y linux-headers-generic linux-image-generic</code>" in text
     assert "install --only-upgrade -y linux-image-6.8.0" not in text
-    # ... et l'ancien noyau inutilisé est à supprimer.
-    assert "autoremove --purge" in text
+    # ... et l'ancien noyau est supprimé explicitement (autoremove garde le noyau précédent).
+    assert "<code>sudo apt-get purge -y linux-image-6.8.0-40-generic</code>" in text
     assert "sudo reboot" in text
+
+
+def test_old_kernel_leftovers_without_flavor_are_purged():
+    # Cas réel : noyau 6.14.0-15 resté installé, le serveur tourne sur 6.14.0-37.
+    pkgs = ["linux-headers-6.14.0-15", "linux-headers-6.14.0-15-generic", "linux-modules-6.14.0-15-generic",
+            "linux-tools-6.14.0-15", "linux-tools-6.14.0-15-generic"]
+    result = cve.TargetResult("hôte", [vuln(p, "6.14.0-15.15", "6.14.0-37.37", cls="os-pkgs", pkg_type="ubuntu",
+                                            cve_id=f"C{i}") for i, p in enumerate(pkgs)])
+    text = remedy.advise_host(result, running_kernel="6.14.0-37-generic")
+    assert "--only-upgrade" not in text  # rien à « mettre à jour » : tout est à supprimer
+    assert "sudo apt-get purge -y " + " ".join(pkgs) in text
+    assert "sudo reboot" not in text
+
+
+def test_newer_installed_kernel_needs_reboot_not_purge():
+    result = cve.TargetResult("hôte", [vuln("linux-tools-6.14.0-37-generic", "6.14.0-37.37", "6.14.0-40.40",
+                                            cls="os-pkgs", pkg_type="ubuntu")])
+    text = remedy.advise_host(result, running_kernel="6.14.0-15-generic")
+    assert "purge" not in text
+    assert "prochain redémarrage" in text and "sudo reboot" in text
 
 
 def test_third_party_go_binary_in_built_image(tmp_path: Path):

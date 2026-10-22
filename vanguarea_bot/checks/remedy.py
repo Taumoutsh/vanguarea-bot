@@ -8,6 +8,7 @@ import re
 import shlex
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..config import Config
@@ -61,35 +62,48 @@ def _fixes(vulns: list[Vuln]) -> dict[str, tuple[str, str, list[str]]]:
     return out
 
 
-# Paquet noyau dont le nom contient la version : linux-image-6.8.0-45-generic, linux-headers-6.1.0-18-amd64...
+# Paquet noyau dont le nom contient la version : linux-image-6.8.0-45-generic, linux-headers-6.14.0-15,
+# linux-tools-6.14.0-15-generic, linux-hwe-6.14-tools-6.14.0-15...
 KERNEL_PKG = re.compile(
-    r"^linux-(?P<kind>image|headers|modules(?:-extra)?)-(?:unsigned-)?(?P<release>\d+\.\d+\.\d+-\d+(?:\.\d+)?)-(?P<flavor>[a-z][a-z0-9-]*)$"
+    r"^linux-(?:[a-z0-9.]+-)*?(?P<kind>image|headers|modules-extra|modules|tools|cloud-tools|buildinfo)"
+    r"-(?:unsigned-)?(?P<release>\d+\.\d+\.\d+-\d+)(?:\.\d+)?(?:-(?P<flavor>[a-z][a-z0-9-]*))?$"
 )
+KERNEL_RELEASE = re.compile(r"^(?P<release>\d+\.\d+\.\d+-\d+)(?:-(?P<flavor>.+))?")
 
 
-def _split_kernel_packages(pkgs: list[str], running_kernel: str) -> tuple[list[str], list[str], bool]:
-    """Remplace les paquets noyau versionnés par leur méta-paquet.
+@dataclass
+class KernelSplit:
+    upgrade: list[str]  # paquets (non versionnés) ou méta-paquets à mettre à jour
+    old: list[str]  # paquets d'anciens noyaux, à supprimer
+    pending: list[str]  # noyau plus récent déjà installé, actif au prochain redémarrage
+    running_affected: bool  # le noyau en cours est vulnérable : nouveau noyau + redémarrage
 
-    Un paquet « linux-image-6.8.0-45-generic » ne se met jamais à jour : le correctif arrive
-    dans un nouveau paquet (6.8.0-50) installé via le méta-paquet « linux-image-generic ».
-    Retourne (paquets à mettre à jour, anciens noyaux inutilisés, noyau en cours concerné).
+
+def _split_kernel_packages(pkgs: list[str], running_kernel: str) -> KernelSplit:
+    """Sépare les paquets noyau versionnés selon le noyau en cours d'exécution.
+
+    Un paquet « linux-image-6.8.0-45-generic » ne se met jamais à jour : le correctif arrive dans
+    un nouveau paquet (6.8.0-50) installé via le méta-paquet « linux-image-generic ». Les paquets
+    d'un ancien noyau se suppriment explicitement (apt autoremove conserve le noyau précédent).
     """
-    upgrade: list[str] = []
-    old: list[str] = []
-    running_affected = False
+    run = KERNEL_RELEASE.match(running_kernel)
+    run_release, run_flavor = (run["release"], run["flavor"] or "generic") if run else ("", "generic")
+    split = KernelSplit([], [], [], False)
     for pkg in pkgs:
         m = KERNEL_PKG.match(pkg)
-        if not m:
-            upgrade.append(pkg)
-            continue
-        if f"{m['release']}-{m['flavor']}" != running_kernel:
-            old.append(pkg)
-            continue
-        running_affected = True
-        meta = f"linux-headers-{m['flavor']}" if m["kind"] == "headers" else f"linux-image-{m['flavor']}"
-        if meta not in upgrade:
-            upgrade.append(meta)
-    return upgrade, old, running_affected
+        if not m or not run_release:
+            split.upgrade.append(pkg)
+        elif m["release"] == run_release:
+            split.running_affected = True
+            kind = m["kind"] if m["kind"] in ("headers", "tools", "cloud-tools") else "image"
+            meta = f"linux-{kind}-{run_flavor}"
+            if meta not in split.upgrade:
+                split.upgrade.append(meta)
+        elif _vkey(m["release"]) < _vkey(run_release):
+            split.old.append(pkg)
+        else:
+            split.pending.append(pkg)
+    return split
 
 
 def _find_file(root: Path, name: str, depth: int = 2) -> Path | None:
@@ -127,11 +141,16 @@ def os_package_advice(pkg_type: str, fixes: dict, in_image: bool, running_kernel
         return lines
 
     pkgs = sorted(fixes)
-    old_kernels: list[str] = []
-    kernel_update = False
+    split = KernelSplit(pkgs, [], [], False)
     if pkg_type in APT_FAMILY:
-        pkgs, old_kernels, kernel_update = _split_kernel_packages(pkgs, running_kernel)
-    kernel_update = kernel_update or any(p.startswith(("linux-image", "kernel", "linux-generic")) for p in pkgs)
+        split = _split_kernel_packages(pkgs, running_kernel)
+        pkgs = split.upgrade
+        if split.old:
+            # Pas de « → version » pour un ancien noyau : il se supprime, il ne se met pas à jour.
+            lines = _bullets({p: f for p, f in fixes.items() if p not in split.old})
+            lines += [f"• <code>{esc(p)}</code> — ancien noyau" for p in split.old]
+    kernel_update = split.running_affected or any(p.startswith(("linux-image", "kernel", "linux-generic"))
+                                                  for p in pkgs)
 
     names = " ".join(pkgs)
     if not pkgs:
@@ -148,11 +167,18 @@ def os_package_advice(pkg_type: str, fixes: dict, in_image: bool, running_kernel
         cmds = []
     if cmds:
         lines += ["", "🔧 <b>Mettre à jour</b>", *_steps(cmds)]
-    if old_kernels:
-        lines += ["", f"🗑 <b>Anciens noyaux inutilisés</b> : {esc(', '.join(old_kernels))}",
-                  *_steps(["sudo apt-get autoremove --purge -y"])]
-    if kernel_update:
+    if split.old:
+        lines += ["", f"🗑 <b>Anciens noyaux inutilisés</b> (noyau en cours : <code>{esc(running_kernel)}</code>)",
+                  *_steps(["sudo apt-get purge -y " + " ".join(split.old)]),
+                  "<i>apt supprimera aussi le linux-image correspondant : c'est voulu. "
+                  "(apt autoremove ne le fait pas, il conserve le noyau précédent.)</i>"]
+    if split.pending:
+        lines += ["", "🔁 <b>Noyau plus récent déjà installé</b>, actif au prochain redémarrage : "
+                  f"{esc(', '.join(split.pending))}", *_steps(["sudo reboot"])]
+    elif kernel_update:
         lines += ["", "🔁 <b>Nouveau noyau</b> : redémarrer ensuite le serveur", *_steps(["sudo reboot"])]
+        if split.running_affected:
+            lines.append("<i>Noyau HWE ? Mettez plutôt à jour linux-generic-hwe-XX.XX.</i>")
     return lines
 
 
