@@ -206,7 +206,7 @@ def npm_advice(fixes: dict, workdir: Path | None, host_root: Path = Path("/")) -
     direct = _npm_direct_deps(pkg_json)
     direct_fix = {p: f for p, f in fixes.items() if p in direct}
     indirect_fix = {p: f for p, f in fixes.items() if p not in direct}
-    folder = _shown(pkg_json.parent, host_root) if pkg_json else None
+    folder = _shown(pkg_json.parent, host_root) if pkg_json else (_shown(workdir, host_root) if workdir else None)
     lines = ["", "📦 <b>npm</b>" + (f" — <code>{esc(folder)}</code>" if folder else ""), *_bullets(fixes)]
     cmds = [f"cd {shlex.quote(folder)}"] if folder else []
     if direct_fix:
@@ -331,7 +331,74 @@ def go_advice(vulns: list[Vuln], workdir: Path | None, host_root: Path = Path("/
     return lines
 
 
-def advise_host(result: TargetResult, running_kernel: str | None = None) -> str:
+# Dossiers gérés par un outil (éditeur, IDE...) : leurs dépendances se corrigent en mettant l'outil à jour.
+TOOL_DIRS = [
+    (".vscode-server-insiders", "VS Code Server (Insiders) et ses extensions"),
+    (".vscode-server", "VS Code Server et ses extensions"),
+    (".cursor-server", "Cursor Server et ses extensions"),
+    (".cache/JetBrains", "IDE JetBrains (GoLand, IntelliJ…)"),
+    (".local/share/JetBrains", "IDE JetBrains (GoLand, IntelliJ…)"),
+    (".npm/_npx", "Cache npx"),
+    (".cache/ms-playwright", "Navigateurs Playwright"),
+]
+
+
+def _short(path: str) -> str:
+    """Chemin raccourci pour l'affichage : /home/ubuntu/x → ~/x."""
+    return re.sub(r"^/home/[^/]+", "~", path)
+
+
+def _host_origin(path: str) -> tuple[str, str, str]:
+    """(dossier racine, libellé, type) d'une dépendance trouvée sur le serveur."""
+    p = "/" + path.lstrip("/")
+    for marker, label in TOOL_DIRS:
+        idx = p.find(f"/{marker}/")
+        if idx != -1:
+            return p[: idx + len(marker) + 1], label, "tool"
+    if "/node_modules/" in p:
+        return p[: p.index("/node_modules/")], "Projet Node.js", "npm"
+    for marker in ("/site-packages/", "/dist-packages/"):
+        if marker in p:
+            root = p[: p.index(marker)]
+            if root.startswith("/usr/"):
+                return root, "Python du système", "pip-system"
+            return re.sub(r"/lib/python[^/]*$", "", root), "Environnement Python", "pip"
+    return p, "Fichier", "other"
+
+
+def host_lang_advice(vulns: list[Vuln], host_root: Path = Path("/")) -> list[str]:
+    """Dépendances applicatives du serveur, regroupées par origine (outil, projet, environnement Python)."""
+    groups: dict[tuple[str, str, str], list[Vuln]] = defaultdict(list)
+    for v in vulns:
+        groups[_host_origin(v.path)].append(v)
+
+    lines: list[str] = []
+    for (root, label, kind), gvulns in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        fixes = _fixes(gvulns)
+        pkgs = sorted({v.pkg for v in gvulns})
+        if kind == "tool":
+            names = ", ".join(pkgs[:5]) + (f" +{len(pkgs) - 5}" if len(pkgs) > 5 else "")
+            lines += ["", f"🧩 <b>{esc(label)}</b> — <code>{esc(_short(root))}</code>",
+                      f"{len(gvulns)} CVE dans ses dépendances internes ({esc(names)}).",
+                      "<i>Gérées par l'outil lui-même : mettez à jour l'outil et ses extensions, "
+                      "puis supprimez les anciennes versions restées en cache avec /cleanup.</i>"]
+        elif kind == "npm" and fixes:
+            lines += npm_advice(fixes, host_root / root.lstrip("/"), host_root)
+        elif kind == "pip" and fixes:
+            cmd = f"{shlex.quote(root + '/bin/pip')} install " + " ".join(
+                shlex.quote(f"{p}>={t}") for p, (_, t, _) in sorted(fixes.items()))
+            lines += ["", f"📦 <b>{esc(label)}</b> — <code>{esc(_short(root))}</code>", *_bullets(fixes),
+                      "🔧 <b>Mettre à jour</b>", *_steps([cmd]),
+                      "<i>Pensez à reporter les versions dans le requirements.txt du projet.</i>"]
+        elif kind == "pip-system":
+            lines += ["", f"📦 <b>{esc(label)}</b> — <code>{esc(root)}</code>", *_bullets(fixes),
+                      "<i>Installés par les paquets du système : corrigés par les mises à jour apt.</i>"]
+        else:
+            lines += ["", f"📦 <b>{esc(label)}</b> — <code>{esc(_short(root))}</code>", *_bullets(fixes)]
+    return lines
+
+
+def advise_host(result: TargetResult, running_kernel: str | None = None, host_root: Path = Path("/")) -> str:
     lines = ["🖥 <b>Serveur</b>"]
     os_vulns = [v for v in result.vulns if v.cls == "os-pkgs"]
     lang_vulns = [v for v in result.vulns if v.cls != "os-pkgs"]
@@ -345,10 +412,7 @@ def advise_host(result: TargetResult, running_kernel: str | None = None) -> str:
                 lines += os_package_advice(pkg_type, fixes, in_image=False,
                                            running_kernel=running_kernel or os.uname().release)
     if lang_vulns:
-        lines += ["", "📦 <b>Dépendances applicatives installées sur le serveur</b>"]
-        for v in lang_vulns:
-            lines.append(f"• <code>{esc(v.pkg)}</code> {esc(v.installed)} → <b>{esc(v.fixed or '?')}</b> "
-                         f"— <code>{esc(v.path)}</code>")
+        lines += host_lang_advice(lang_vulns, host_root)
     return "\n".join(lines)
 
 
@@ -427,7 +491,7 @@ def advise(cfg: Config, results: list[TargetResult], contexts: dict[str, list[Im
             continue
         if r.target == "hôte":
             if project in (None, "hôte", "serveur", "host"):
-                blocks.append(advise_host(r))
+                blocks.append(advise_host(r, host_root=cfg.host_root))
             continue
         ctxs = contexts.get(r.target, [])
         if project and not any(project in (c.project, c.service, c.container) for c in ctxs) and project != r.target:

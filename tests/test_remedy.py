@@ -165,3 +165,18 @@ def test_chunk_message_never_splits_blockquote():
     for chunk in chunks:
         assert chunk.count("<blockquote") == chunk.count("</blockquote>")
         _assert_balanced_html(chunk)
+
+
+def test_host_dependencies_grouped_by_origin(tmp_path):
+    base = "home/ubuntu/.vscode-server/data/agent-host/sdk-cache/claude/0.3.220/linux-x64/node_modules"
+    vulns = [cve.Vuln(f"CVE-{i}", "CRITICAL", "fast-uri", "3.1.2", "2.4.3, 3.1.4, 4.1.1", "", "", "lang-pkgs",
+                      "node-pkg", f"{base}/fast-uri/package.json") for i in range(12)]
+    vulns.append(cve.Vuln("CVE-X", "CRITICAL", "requests", "2.0.0", "2.32.0", "", "", "lang-pkgs", "python-pkg",
+                          "opt/app/venv/lib/python3.12/site-packages/requests-2.0.0.dist-info/METADATA"))
+    text = remedy.advise_host(cve.TargetResult("hôte", vulns), running_kernel="x")
+    _assert_balanced_html(text)
+    # Une seule entrée pour l'extension VS Code, pas une ligne par CVE
+    assert text.count("fast-uri") == 1
+    assert "VS Code Server" in text and "<code>~/.vscode-server</code>" in text and "/cleanup" in text
+    assert "<code>/opt/app/venv/bin/pip install &#x27;requests&gt;=2.32.0&#x27;</code>" in text or \
+        "/opt/app/venv/bin/pip install 'requests&gt;=2.32.0'" in text
