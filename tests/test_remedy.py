@@ -180,3 +180,27 @@ def test_host_dependencies_grouped_by_origin(tmp_path):
     assert "VS Code Server" in text and "<code>~/.vscode-server</code>" in text and "/cleanup" in text
     assert "<code>/opt/app/venv/bin/pip install &#x27;requests&gt;=2.32.0&#x27;</code>" in text or \
         "/opt/app/venv/bin/pip install 'requests&gt;=2.32.0'" in text
+
+
+def test_system_binaries_mapped_to_their_package():
+    def vuln_in(path, pkg):
+        return cve.Vuln("CVE-1", "CRITICAL", pkg, "v0.26.3", "0.28.1", "", "", "lang-pkgs", "gobinary", path)
+
+    vulns = [vuln_in("usr/libexec/docker/cli-plugins/docker-compose", "github.com/moby/buildkit"),
+             vuln_in("usr/libexec/docker/cli-plugins/docker-buildx", "github.com/moby/spdystream"),
+             vuln_in("usr/local/bin/outil-maison", "golang.org/x/net")]
+    owners = {"/usr/libexec/docker/cli-plugins/docker-compose": ("apt", "docker-compose-plugin"),
+              "/usr/libexec/docker/cli-plugins/docker-buildx": ("apt", "docker-buildx-plugin")}
+    text = remedy.advise_host(cve.TargetResult("hôte", vulns), running_kernel="x", owner_of=owners.get)
+    _assert_balanced_html(text)
+    assert "sudo apt-get install --only-upgrade -y docker-buildx-plugin docker-compose-plugin</code>" in text
+    assert "hors gestionnaire de paquets" in text and "outil-maison" in text
+
+
+def test_package_owner_parses_dpkg(monkeypatch):
+    from vanguarea_bot.utils import CmdResult
+
+    monkeypatch.setattr(remedy, "run_host_cmd", lambda cfg, args, timeout=0: CmdResult(
+        0, "libssl3t64:amd64: /usr/lib/x86_64-linux-gnu/libssl.so.3\n", "") if args[0] == "dpkg-query"
+        else CmdResult(1, "", ""))
+    assert remedy.package_owner(Config(token="x", chat_ids=frozenset({1})), "/usr/lib/x") == ("apt", "libssl3t64")

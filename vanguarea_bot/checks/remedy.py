@@ -7,10 +7,11 @@ import os
 import re
 import shlex
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
 
 from ..config import Config
-from ..utils import copy_steps as _steps, esc
+from ..utils import copy_steps as _steps, esc, run_host_cmd
 from .cve import TargetResult, Vuln
 from .docker_check import ImageContext
 
@@ -366,13 +367,49 @@ def _host_origin(path: str) -> tuple[str, str, str]:
     return p, "Fichier", "other"
 
 
-def host_lang_advice(vulns: list[Vuln], host_root: Path = Path("/")) -> list[str]:
+def package_owner(cfg: Config, path: str) -> tuple[str, str] | None:
+    """Paquet système qui a installé un fichier : ("apt", "docker-compose-plugin"), ("dnf", ...) ou None."""
+    res = run_host_cmd(cfg, ["dpkg-query", "-S", path], timeout=20)
+    if res.ok and res.stdout.strip():
+        line = next((l for l in res.stdout.splitlines() if not l.startswith("diversion")), "")
+        pkg = line.split(": ", 1)[0].split(",")[0].strip()
+        if pkg:
+            return "apt", re.sub(r":[a-z0-9_]+$", "", pkg)  # sans le suffixe d'architecture (:amd64)
+    res = run_host_cmd(cfg, ["rpm", "-qf", "--qf", "%{NAME}\n", path], timeout=20)
+    if res.ok and res.stdout.strip() and "not owned" not in res.stdout:
+        return "dnf", res.stdout.split()[0]
+    return None
+
+
+def _owned_files_advice(owned: dict[tuple[str, str], list[tuple[str, int]]]) -> list[str]:
+    """Binaires installés par des paquets système : mise à jour de ces paquets."""
+    lines = ["", "📦 <b>Binaires installés par des paquets système</b>"]
+    for (_, pkg), files in sorted(owned.items()):
+        for path, count in files:
+            lines.append(f"• <code>{esc(pkg)}</code> — {esc(path.rsplit('/', 1)[-1])} ({count} CVE)")
+    by_manager: dict[str, list[str]] = defaultdict(list)
+    for manager, pkg in sorted(owned):
+        by_manager[manager].append(pkg)
+    lines.append("🔧 <b>Mettre à jour</b>")
+    for manager, pkgs in by_manager.items():
+        if manager == "apt":
+            lines += _steps(["sudo apt-get update", "sudo apt-get install --only-upgrade -y " + " ".join(pkgs)])
+        else:
+            lines += _steps(["sudo dnf upgrade -y " + " ".join(pkgs)])
+    lines.append("<i>Ce sont des bibliothèques compilées dans ces binaires : si les CVE restent après la mise à "
+                 "jour, l'éditeur n'a pas encore publié de version corrigée.</i>")
+    return lines
+
+
+def host_lang_advice(vulns: list[Vuln], host_root: Path = Path("/"),
+                     owner_of: Callable[[str], tuple[str, str] | None] | None = None) -> list[str]:
     """Dépendances applicatives du serveur, regroupées par origine (outil, projet, environnement Python)."""
     groups: dict[tuple[str, str, str], list[Vuln]] = defaultdict(list)
     for v in vulns:
         groups[_host_origin(v.path)].append(v)
 
     lines: list[str] = []
+    owned: dict[tuple[str, str], list[tuple[str, int]]] = {}
     for (root, label, kind), gvulns in sorted(groups.items(), key=lambda kv: -len(kv[1])):
         fixes = _fixes(gvulns)
         pkgs = sorted({v.pkg for v in gvulns})
@@ -394,11 +431,20 @@ def host_lang_advice(vulns: list[Vuln], host_root: Path = Path("/")) -> list[str
             lines += ["", f"📦 <b>{esc(label)}</b> — <code>{esc(root)}</code>", *_bullets(fixes),
                       "<i>Installés par les paquets du système : corrigés par les mises à jour apt.</i>"]
         else:
-            lines += ["", f"📦 <b>{esc(label)}</b> — <code>{esc(_short(root))}</code>", *_bullets(fixes)]
+            owner = owner_of(root) if owner_of else None
+            if owner:
+                owned.setdefault(owner, []).append((root, len(gvulns)))
+                continue
+            lines += ["", f"📦 <b>{esc(label)}</b> — <code>{esc(_short(root))}</code>", *_bullets(fixes),
+                      "<i>Installé hors gestionnaire de paquets : mettez à jour le logiciel qui l'a installé, "
+                      "ou supprimez-le s'il ne sert plus.</i>"]
+    if owned:
+        lines += _owned_files_advice(owned)
     return lines
 
 
-def advise_host(result: TargetResult, running_kernel: str | None = None, host_root: Path = Path("/")) -> str:
+def advise_host(result: TargetResult, running_kernel: str | None = None, host_root: Path = Path("/"),
+                owner_of: Callable[[str], tuple[str, str] | None] | None = None) -> str:
     lines = ["🖥 <b>Serveur</b>"]
     os_vulns = [v for v in result.vulns if v.cls == "os-pkgs"]
     lang_vulns = [v for v in result.vulns if v.cls != "os-pkgs"]
@@ -412,7 +458,7 @@ def advise_host(result: TargetResult, running_kernel: str | None = None, host_ro
                 lines += os_package_advice(pkg_type, fixes, in_image=False,
                                            running_kernel=running_kernel or os.uname().release)
     if lang_vulns:
-        lines += host_lang_advice(lang_vulns, host_root)
+        lines += host_lang_advice(lang_vulns, host_root, owner_of)
     return "\n".join(lines)
 
 
@@ -491,7 +537,7 @@ def advise(cfg: Config, results: list[TargetResult], contexts: dict[str, list[Im
             continue
         if r.target == "hôte":
             if project in (None, "hôte", "serveur", "host"):
-                blocks.append(advise_host(r, host_root=cfg.host_root))
+                blocks.append(advise_host(r, host_root=cfg.host_root, owner_of=lambda p: package_owner(cfg, p)))
             continue
         ctxs = contexts.get(r.target, [])
         if project and not any(project in (c.project, c.service, c.container) for c in ctxs) and project != r.target:
