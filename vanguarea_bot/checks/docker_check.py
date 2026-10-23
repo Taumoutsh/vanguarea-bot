@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import logging
+import shlex
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import docker
 from docker.errors import DockerException
 
 from ..config import Config
 from ..state import CRITICAL, WARNING, Alert, State
-from ..utils import esc, human_bytes
+from ..utils import copy_steps, esc, human_bytes, human_duration
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +31,9 @@ class ContainerInfo:
     mem_usage: int | None = None
     mem_limit: int | None = None
     cpu_percent: float | None = None
+    project: str | None = None
+    oneoff: bool = False  # conteneur ponctuel créé par « docker compose run »
+    started_at: float | None = None
 
 
 def _client(cfg: Config) -> docker.DockerClient:
@@ -48,9 +54,20 @@ def _cpu_percent(stats: dict) -> float | None:
     return None
 
 
+def _parse_time(value: str | None) -> float | None:
+    """Horodatage Docker (« 2026-10-22T20:09:36.92106902Z ») en secondes depuis l'epoch."""
+    if not value or value.startswith("0001-"):
+        return None
+    try:
+        return datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
 def parse_container(attrs: dict) -> ContainerInfo:
     st = attrs.get("State", {})
     image = attrs.get("Config", {}).get("Image") or attrs.get("Image", "?")
+    labels = attrs.get("Config", {}).get("Labels") or {}
     return ContainerInfo(
         name=attrs.get("Name", "?").lstrip("/"),
         image=image,
@@ -59,6 +76,9 @@ def parse_container(attrs: dict) -> ContainerInfo:
         exit_code=st.get("ExitCode", 0),
         restart_count=attrs.get("RestartCount", 0),
         oom_killed=bool(st.get("OOMKilled")),
+        project=labels.get("com.docker.compose.project"),
+        oneoff=labels.get("com.docker.compose.oneoff", "").lower() == "true",
+        started_at=_parse_time(st.get("StartedAt")),
     )
 
 
@@ -137,12 +157,53 @@ def image_contexts(cfg: Config) -> dict[str, list[ImageContext]]:
         client.close()
 
 
-def alerts(containers: list[ContainerInfo], cfg: Config, state: State) -> list[Alert]:
+ONEOFF_MAX_AGE = 3600  # une tâche « compose run » encore active après 1 h est probablement bloquée
+
+
+def oneoff_alerts(containers: list[ContainerInfo], now: float | None = None) -> list[Alert]:
+    """Une alerte par projet pour les conteneurs ponctuels (« docker compose run ») qui s'accumulent.
+
+    Ces conteneurs héritent du healthcheck du service (qui teste l'API) alors qu'ils exécutent une tâche :
+    ils sont donc presque toujours « unhealthy ». On ne les signale pas un par un.
+    """
+    now = time.time() if now is None else now
+    by_project: dict[str, list[ContainerInfo]] = {}
+    for c in containers:
+        if c.oneoff:
+            by_project.setdefault(c.project or "?", []).append(c)
     out: list[Alert] = []
+    for project, items in sorted(by_project.items()):
+        stuck = [c for c in items if c.status == "running" and c.started_at and now - c.started_at >= ONEOFF_MAX_AGE]
+        failed = [c for c in items if c.status == "exited" and c.exit_code != 0]
+        if not stuck and not failed:
+            continue
+        lines = []
+        if stuck:
+            oldest = max(now - c.started_at for c in stuck)
+            lines.append(f"• <b>{len(stuck)}</b> encore actif(s) depuis plus d'1 h (le plus ancien : "
+                         f"{human_duration(oldest)})")
+        if failed:
+            lines.append(f"• <b>{len(failed)}</b> terminé(s) en erreur, non supprimé(s)")
+        filters = (f"--filter label=com.docker.compose.oneoff=True "
+                   f"--filter label=com.docker.compose.project={shlex.quote(project)}")
+        lines += ["", "<i>Créés par « docker compose run » (cron, script…) : lancez-les avec --rm, ou utilisez "
+                      "« docker compose exec » pour une tâche dans le service déjà démarré.</i>",
+                  "🔎 <b>Voir ce qu'ils exécutent</b>",
+                  *copy_steps([f"docker ps -a {filters} --format '{{{{.Names}}}} | {{{{.Status}}}} | "
+                               f"{{{{.Command}}}}'"]),
+                  "🗑 <b>Les supprimer</b>",
+                  *copy_steps([f"docker ps -aq {filters} | xargs -r docker rm -f"])]
+        out.append(Alert(f"docker:oneoff:{project}", WARNING,
+                         f"Tâches « docker compose run » qui s'accumulent ({esc(project)})", "\n".join(lines)))
+    return out
+
+
+def alerts(containers: list[ContainerInfo], cfg: Config, state: State) -> list[Alert]:
+    out: list[Alert] = oneoff_alerts([c for c in containers if c.name not in cfg.docker_ignore])
     with state.lock:
         restarts = state.section("docker_restart_counts")
         for c in containers:
-            if c.name in cfg.docker_ignore:
+            if c.name in cfg.docker_ignore or c.oneoff:
                 continue
             label = f"Conteneur <code>{esc(c.name)}</code>"
             if c.oom_killed:
@@ -183,7 +244,7 @@ def format_containers(containers: list[ContainerInfo]) -> str:
         if c.health == "unhealthy":
             icon = "🔴"
         line = f"{icon} <b>{esc(c.name)}</b>"
-        details = []
+        details = ["tâche compose run"] if c.oneoff else []
         if c.status != "running":
             details.append(f"{c.status} ({c.exit_code})")
         if c.health:
