@@ -8,6 +8,7 @@ import re
 import shlex
 from collections import defaultdict
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -137,7 +138,8 @@ def _npm_direct_deps(package_json: Path | None) -> set[str]:
 
 
 def os_package_advice(pkg_type: str, fixes: dict, in_image: bool, running_kernel: str = "") -> list[str]:
-    lines = _bullets(fixes)
+    eco = "apt" if pkg_type in APT_FAMILY and not in_image else None
+    lines = _bullets(fixes, eco=eco)
     if in_image:
         return lines
 
@@ -148,8 +150,11 @@ def os_package_advice(pkg_type: str, fixes: dict, in_image: bool, running_kernel
         pkgs = split.upgrade
         if split.old:
             # Pas de « → version » pour un ancien noyau : il se supprime, il ne se met pas à jour.
-            lines = _bullets({p: f for p, f in fixes.items() if p not in split.old})
+            lines = _bullets({p: f for p, f in fixes.items() if p not in split.old}, eco=eco)
             lines += [f"• <code>{esc(p)}</code> — ancien noyau" for p in split.old]
+    # Version corrigée absente des dépôts : « apt upgrade » ne changerait rien, on ne la propose pas.
+    not_in_repos = sorted(_unavailable({p: fixes[p] for p in pkgs if p in fixes}, eco)) if eco else []
+    pkgs = [p for p in pkgs if p not in not_in_repos]
     kernel_update = split.running_affected or any(p.startswith(("linux-image", "kernel", "linux-generic"))
                                                   for p in pkgs)
 
@@ -168,6 +173,10 @@ def os_package_advice(pkg_type: str, fixes: dict, in_image: bool, running_kernel
         cmds = []
     if cmds:
         lines += ["", "🔧 <b>Mettre à jour</b>", *_steps(cmds)]
+    if not_in_repos:
+        lines += ["", f"⏳ <b>Correctif pas encore dans vos dépôts</b> : {esc(', '.join(not_in_repos))}",
+                  "<i>Après un apt-get update, s'il manque toujours : la distribution ne l'a pas encore publié, "
+                  "ou il est réservé à Ubuntu Pro / ESM (voir « pro status »).</i>"]
     if split.old:
         lines += ["", f"🗑 <b>Anciens noyaux inutilisés</b> (noyau en cours : <code>{esc(running_kernel)}</code>)",
                   *_steps(["sudo apt-get purge -y " + " ".join(split.old)]),
@@ -216,10 +225,38 @@ def lang_advice(vulns: list[Vuln], workdir: Path | None, host_root: Path = Path(
     return lines
 
 
-def _bullets(fixes: dict, limit: int = 6) -> list[str]:
+# Disponibilité des versions corrigées (voir packages.py), positionnée par advise() pour la durée du calcul.
+_PKG_INFO: ContextVar[dict[str, dict]] = ContextVar("pkg_info", default={})
+NOT_AVAILABLE = {"apt": "pas encore dans vos dépôts", "npm": "pas encore publiée sur npm",
+                 "pypi": "pas encore publiée sur PyPI", "go": "pas encore publiée"}
+
+
+def _info(eco: str | None, pkg: str) -> dict | None:
+    return _PKG_INFO.get().get(f"{eco}:{pkg}") if eco else None
+
+
+def _unavailable(fixes: dict, eco: str) -> dict:
+    """Paquets dont la version corrigée n'est pas (encore) installable : à exclure des commandes."""
+    return {p: f for p, f in fixes.items() if (_info(eco, p) or {}).get("available") is False}
+
+
+def _availability(eco: str | None, pkg: str, target: str) -> str:
+    info = _info(eco, pkg)
+    if not info:
+        return ""
+    latest = info.get("latest")
+    if info.get("available") is False:
+        return f" ⏳ <i>{NOT_AVAILABLE.get(eco, 'pas encore disponible')}</i>"
+    if latest and _vkey(latest.lstrip("v")) > _vkey(target.lstrip("v")):
+        return f" · <i>dernière : {esc(latest)}</i>"
+    return ""
+
+
+def _bullets(fixes: dict, limit: int = 6, eco: str | None = None) -> list[str]:
     """Paquets à mettre à jour (les premiers seulement, pour rester lisible)."""
     items = sorted(fixes.items())
-    lines = [f"• <code>{esc(p)}</code> {esc(i)} → <b>{esc(t)}</b>" for p, (i, t, _) in items[:limit]]
+    lines = [f"• <code>{esc(p)}</code> {esc(i)} → <b>{esc(t)}</b>{_availability(eco, p, t)}"
+             for p, (i, t, _) in items[:limit]]
     if len(items) > limit:
         lines.append(f"• … et {len(items) - limit} autre(s) paquet(s)")
     return lines
@@ -232,10 +269,13 @@ def npm_advice(fixes: dict, workdir: Path | None, host_root: Path = Path("/")) -
     """
     pkg_json = _find_file(workdir, "package.json") if workdir else None
     direct = _npm_direct_deps(pkg_json)
-    direct_fix = {p: f for p, f in fixes.items() if p in direct}
-    indirect_fix = {p: f for p, f in fixes.items() if p not in direct}
+    unpublished = _unavailable(fixes, "npm")
+    direct_fix = {p: f for p, f in fixes.items() if p in direct and p not in unpublished}
+    indirect_fix = {p: f for p, f in fixes.items() if p not in direct and p not in unpublished}
     folder = _shown(pkg_json.parent, host_root) if pkg_json else (_shown(workdir, host_root) if workdir else None)
-    lines = ["", "📦 <b>npm</b>" + (f" — <code>{esc(folder)}</code>" if folder else ""), *_bullets(fixes)]
+    lines = ["", "📦 <b>npm</b>" + (f" — <code>{esc(folder)}</code>" if folder else ""), *_bullets(fixes, eco="npm")]
+    if not direct_fix and not indirect_fix:
+        return lines
     cmds = [f"cd {shlex.quote(folder)}"] if folder else []
     if direct_fix:
         cmds.append("npm install " + " ".join(f"{p}@^{t}" for p, (_, t, _) in sorted(direct_fix.items())))
@@ -294,15 +334,18 @@ def pip_advice(fixes: dict, workdir: Path | None, host_root: Path = Path("/")) -
     req = _find_file(workdir, "requirements.txt") if workdir else None
     if not req:
         return ["", "📦 <b>Python</b> — à mettre à jour dans <code>requirements.txt</code> ou <code>pyproject.toml</code>",
-                *_bullets(fixes)]
+                *_bullets(fixes, eco="pypi")]
     shown = _shown(req, host_root)
     try:
         content = req.read_text(errors="replace")
     except OSError:
         content = ""
-    targets = {p: t for p, (_, t, _) in fixes.items()}
-    return ["", f"📦 <b>Python</b> — <code>{esc(shown)}</code>", *_bullets(fixes), "🔧 <b>Mettre à jour</b>",
-            *_steps(requirements_commands(content, targets, shown))]
+    unpublished = _unavailable(fixes, "pypi")
+    targets = {p: t for p, (_, t, _) in fixes.items() if p not in unpublished}
+    lines = ["", f"📦 <b>Python</b> — <code>{esc(shown)}</code>", *_bullets(fixes, eco="pypi")]
+    if targets:
+        lines += ["🔧 <b>Mettre à jour</b>", *_steps(requirements_commands(content, targets, shown))]
+    return lines
 
 
 def _go_module(workdir: Path | None) -> tuple[Path | None, str | None]:
@@ -348,11 +391,13 @@ def go_advice(vulns: list[Vuln], workdir: Path | None, host_root: Path = Path("/
         stdlib = fixes.pop("stdlib", None)
         if fixes:
             where = f" — <code>{esc(_shown(go_mod.parent, host_root))}</code>" if go_mod else ""
-            lines += ["", f"📦 <b>Go</b>{where}", "🔧 <b>Mettre à jour</b>"]
-            cmds = ([f"cd {_shown(go_mod.parent, host_root)}"] if go_mod else [])
-            cmds += ["go get " + " ".join(f"{p}@v{t.lstrip('v')}" for p, (_, t, _) in sorted(fixes.items())),
-                     "go mod tidy"]
-            lines += _steps(cmds)
+            lines += ["", f"📦 <b>Go</b>{where}", *_bullets(fixes, eco="go")]
+            published = {p: f for p, f in fixes.items() if p not in _unavailable(fixes, "go")}
+            if published:
+                cmds = ([f"cd {_shown(go_mod.parent, host_root)}"] if go_mod else [])
+                cmds += ["go get " + " ".join(f"{p}@v{t.lstrip('v')}" for p, (_, t, _) in sorted(published.items())),
+                         "go mod tidy"]
+                lines += ["🔧 <b>Mettre à jour</b>", *_steps(cmds)]
         if stdlib:
             lines.append(f"📦 <b>Go stdlib</b> : compiler avec Go ≥ <b>{esc(stdlib[1])}</b> "
                          f"(ex. <code>FROM golang:{esc(stdlib[1])}</code> dans le Dockerfile)")
@@ -611,8 +656,18 @@ def advise_image(cfg: Config, result: TargetResult, contexts: list[ImageContext]
 
 
 def advise(cfg: Config, results: list[TargetResult], contexts: dict[str, list[ImageContext]],
-           project: str | None = None, updates: dict[str, dict] | None = None) -> list[str]:
+           project: str | None = None, updates: dict[str, dict] | None = None,
+           packages: dict[str, dict] | None = None) -> list[str]:
     """Correctifs pour tous les résultats (ou un seul projet), un message par cible."""
+    token = _PKG_INFO.set(packages or {})
+    try:
+        return _advise(cfg, results, contexts, project, updates)
+    finally:
+        _PKG_INFO.reset(token)
+
+
+def _advise(cfg: Config, results: list[TargetResult], contexts: dict[str, list[ImageContext]],
+            project: str | None, updates: dict[str, dict] | None) -> list[str]:
     blocks = []
     for r in results:
         if r.error or not r.vulns:

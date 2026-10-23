@@ -14,8 +14,8 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, Defaults, filters
 
 from . import __version__
-from .checks import (cleanup, cve, docker_check, exploit_guard, integrity, kev, network, registry, remedy, ssh,
-                     system, web)
+from .checks import (cleanup, cve, docker_check, exploit_guard, integrity, kev, network, packages, registry, remedy,
+                     ssh, system, web)
 from .config import Config, load_config
 from .state import WARNING, Alert, AlertManager, State
 from .utils import chunk_message, esc, human_bytes, human_duration
@@ -126,6 +126,7 @@ class Monitor:
             # Les scans planifiés sont silencieux : seules les failles activement exploitées
             # déclenchent une alerte immédiate. Le reste est résumé dans le rapport quotidien.
             await asyncio.to_thread(self._check_image_updates, results, contexts)
+            await asyncio.to_thread(self._check_packages, results)
             alerts = await asyncio.to_thread(exploit_guard.check, cfg, self.state, results, contexts, kev_db)
             await self.dispatch(app, "kev", alerts)
             if not scheduled:
@@ -148,6 +149,21 @@ class Monitor:
             self.state.section("cve")["image_updates"] = updates
             self.state.save()
 
+    def _check_packages(self, results: list[cve.TargetResult]) -> None:
+        """Version corrigée disponible dans les dépôts apt / publiée sur npm, PyPI, Go ?"""
+        try:
+            infos = packages.check(self.cfg, results)
+        except Exception:  # noqa: BLE001 - information facultative
+            log.exception("Vérification des versions de paquets impossible")
+            return
+        with self.state.lock:
+            self.state.section("cve")["package_updates"] = infos
+            self.state.save()
+
+    def package_updates(self) -> dict[str, dict]:
+        with self.state.lock:
+            return dict(self.state.data.get("cve", {}).get("package_updates", {}))
+
     def image_updates(self) -> dict[str, dict]:
         with self.state.lock:
             return dict(self.state.data.get("cve", {}).get("image_updates", {}))
@@ -158,7 +174,8 @@ class Monitor:
         except Exception:  # noqa: BLE001 - sans Docker, on donne quand même les correctifs de l'hôte
             log.exception("Contexte des images indisponible")
             contexts = {}
-        return await asyncio.to_thread(remedy.advise, self.cfg, results, contexts, project, self.image_updates())
+        return await asyncio.to_thread(remedy.advise, self.cfg, results, contexts, project, self.image_updates(),
+                                       self.package_updates())
 
     async def job_daily_report(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = await self.build_report(update_baseline=True)
@@ -225,6 +242,20 @@ class Monitor:
                 else:
                     lines.append(f"• {esc(u['label'])} : nouvelle image « {esc(u['tag'])} » publiée — {u['cves']} CVE")
             lines.append("Commandes : /fix")
+        pkgs = self.package_updates().values()
+        apt_ready = sum(1 for p in pkgs if p["ecosystem"] == "apt" and p.get("available"))
+        apt_waiting = [p["name"] for p in pkgs if p["ecosystem"] == "apt" and p.get("available") is False]
+        lang_waiting = [p["name"] for p in pkgs if p["ecosystem"] != "apt" and p.get("available") is False]
+        if apt_ready or apt_waiting or lang_waiting:
+            lines += ["", "📦 <b>Correctifs des paquets</b>"]
+            if apt_ready:
+                lines.append(f"• Serveur : <b>{apt_ready}</b> paquet(s) corrigeable(s) maintenant avec apt (/fix serveur)")
+            if apt_waiting:
+                lines.append(f"• Serveur : ⏳ {len(apt_waiting)} correctif(s) pas encore dans vos dépôts "
+                             f"({esc(', '.join(sorted(apt_waiting)[:5]))}{' …' if len(apt_waiting) > 5 else ''})")
+            if lang_waiting:
+                lines.append(f"• Dépendances : ⏳ {len(lang_waiting)} version(s) corrigée(s) pas encore publiée(s) "
+                             f"({esc(', '.join(sorted(lang_waiting)[:5]))}{' …' if len(lang_waiting) > 5 else ''})")
         new, fixed, first = cve.report_diff(self.state, update_baseline)
         if first:
             lines.append("<i>Première référence établie : les nouvelles CVE seront signalées "

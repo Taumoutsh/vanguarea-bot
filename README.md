@@ -109,6 +109,12 @@ Le bot reste **en lecture seule** : il ne modifie jamais votre code ni vos conte
 
 La version proposée est la plus petite version corrigée dans la même version majeure, pour limiter les risques de régression.
 
+À chaque scan, le bot vérifie aussi que la version corrigée est **réellement disponible** :
+- **paquets du serveur** : `apt-cache policy` (comparaison avec `dpkg --compare-versions`) indique si le correctif est dans vos dépôts. Sinon il est signalé ⏳ et retiré de la commande `apt` (la distribution ne l'a pas encore publié, ou il est réservé à Ubuntu Pro / ESM) ;
+- **dépendances npm, PyPI, Go** : le registre (registry.npmjs.org, pypi.org, proxy.golang.org) indique la dernière version publiée (« dernière : x.y.z ») et si la version corrigée existe ; une version non publiée est retirée des commandes.
+
+Le rapport quotidien résume les correctifs installables maintenant et ceux encore en attente.
+
 ## Libérer de l'espace disque
 
 `/cleanup` (également rappelé dans l'alerte « disque plein » et dans le rapport quotidien au-delà de 1 Go) liste ce qui peut être supprimé, avec la commande correspondante. Le bot ne supprime rien lui-même.

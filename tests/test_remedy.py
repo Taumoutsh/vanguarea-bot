@@ -256,3 +256,56 @@ def test_package_owner_parses_dpkg(monkeypatch):
         0, "libssl3t64:amd64: /usr/lib/x86_64-linux-gnu/libssl.so.3\n", "") if args[0] == "dpkg-query"
         else CmdResult(1, "", ""))
     assert remedy.package_owner(Config(token="x", chat_ids=frozenset({1})), "/usr/lib/x") == ("apt", "libssl3t64")
+
+
+def test_apt_fix_not_in_repos_is_excluded_from_command():
+    result = cve.TargetResult("hôte", [vuln("openssl", "3.0.1", "3.0.2", cls="os-pkgs", pkg_type="ubuntu"),
+                                      vuln("libxml2", "2.9.1", "2.9.9", cls="os-pkgs", pkg_type="ubuntu", cve_id="C2")])
+    infos = {"apt:openssl": {"ecosystem": "apt", "name": "openssl", "fixed": "3.0.2", "available": True,
+                             "latest": "3.0.2"},
+             "apt:libxml2": {"ecosystem": "apt", "name": "libxml2", "fixed": "2.9.9", "available": False,
+                             "latest": "2.9.1"}}
+    cfg = Config(token="x", chat_ids=frozenset({1}))
+    text = "\n".join(remedy.advise(cfg, [result], {}, packages=infos))
+    _assert_balanced_html(text)
+    assert "<code>sudo apt-get install --only-upgrade -y openssl</code>" in text
+    assert "Correctif pas encore dans vos dépôts</b> : libxml2" in text and "pro status" in text
+    assert remedy._PKG_INFO.get() == {}  # le contexte est bien remis à zéro
+
+
+def test_unpublished_npm_and_pypi_versions_not_installed(tmp_path):
+    (tmp_path / "package.json").write_text(json.dumps({"dependencies": {"express": "^4.17.0", "qs": "6.5.0"}}))
+    (tmp_path / "requirements.txt").write_text("requests==2.0.0\n")
+    infos = {"npm:express": {"ecosystem": "npm", "name": "express", "fixed": "4.20.0", "available": True,
+                             "latest": "5.1.0"},
+             "npm:qs": {"ecosystem": "npm", "name": "qs", "fixed": "9.9.9", "available": False, "latest": "6.14.0"},
+             "pypi:requests": {"ecosystem": "pypi", "name": "requests", "fixed": "9.0.0", "available": False,
+                               "latest": "2.34.2"}}
+    token = remedy._PKG_INFO.set(infos)
+    try:
+        npm = "\n".join(remedy.npm_advice({"express": ("4.17.0", "4.20.0", ["C"]), "qs": ("6.5.0", "9.9.9", ["C"])},
+                                          tmp_path))
+        pip = "\n".join(remedy.pip_advice({"requests": ("2.0.0", "9.0.0", ["C"])}, tmp_path))
+    finally:
+        remedy._PKG_INFO.reset(token)
+    assert "npm install express@^4.20.0</code>" in npm and "qs@" not in npm
+    assert "dernière : 5.1.0" in npm and "pas encore publiée sur npm" in npm
+    assert "pas encore publiée sur PyPI" in pip and "sed -i" not in pip  # rien d'installable
+
+
+def test_packages_check_apt(monkeypatch, tmp_path):
+    from vanguarea_bot.checks import packages
+    from vanguarea_bot.utils import CmdResult
+
+    def fake(cfg, args, timeout=0):
+        if args[0] == "apt-cache":
+            return CmdResult(0, "openssl:\n  Installed: 3.0.1\n  Candidate: 3.0.3\nlibxml2:amd64:\n"
+                                "  Installed: 2.9.1\n  Candidate: 2.9.1\n", "")
+        a, _, b = args[2:5]
+        return CmdResult(0 if packages._vkey(a) >= packages._vkey(b) else 1, "", "")
+
+    monkeypatch.setattr(packages, "run_host_cmd", fake)
+    result = cve.TargetResult("hôte", [vuln("openssl", "3.0.1", "3.0.2", cls="os-pkgs", pkg_type="ubuntu"),
+                                      vuln("libxml2", "2.9.1", "2.9.9", cls="os-pkgs", pkg_type="ubuntu")])
+    infos = packages.check(Config(token="x", chat_ids=frozenset({1})), [result])
+    assert infos["apt:openssl"]["available"] is True and infos["apt:libxml2"]["available"] is False
