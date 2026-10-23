@@ -160,18 +160,50 @@ def _assert_balanced_html(text: str):
     assert checker.stack == [], f"balises non fermées : {checker.stack}"
 
 
-def test_third_party_image_readable_and_tag_aware():
+def _npm_ctx(tmp_path=None, tag="latest"):
+    files = None
+    if tmp_path is not None:
+        compose = tmp_path / "docker-compose.yml"
+        compose.write_text(f"services:\n  npm:\n    image: 'jc21/nginx-proxy-manager:{tag}'\n")
+        files = str(compose)
+    return ImageContext(f"jc21/nginx-proxy-manager:{tag}", "npm-1", "proxy_manager", "npm",
+                        "/home/ubuntu/proxy_manager", built=False, config_files=files)
+
+
+def _npm_text(ctx, update):
     cfg = Config(token="x", chat_ids=frozenset({1}))
-    ctx = ImageContext("jc21/nginx-proxy-manager:latest", "npm-1", "proxy_manager", "npm",
-                       "/home/ubuntu/proxy_manager", built=False)
     result = cve.TargetResult(ctx.ref, [vuln("libexpat", "2.8.5-r0", "2.9.0-r0", cls="os-pkgs", pkg_type="alpine")])
-    text = remedy.advise(cfg, [result], {ctx.ref: [ctx]})[1]
+    text = remedy.advise(cfg, [result], {ctx.ref: [ctx]}, updates={ctx.ref: update} if update else None)[1]
     _assert_balanced_html(text)
     assert "CVE-2026" not in text  # évite les faux liens « numéro de téléphone » de Telegram
-    assert "pas encore publié" in text and "figée" not in text
-    # une seule commande visible, le détail est replié
+    return text
+
+
+def test_third_party_newer_version_with_compose_edit(tmp_path):
+    import subprocess
+
+    ctx = _npm_ctx(tmp_path, tag="2.11.3")
+    text = _npm_text(ctx, {"tag": "2.11.3", "newer_minor": "2.16.0", "newer_major": "3.0.1"})
+    assert "<b>2.16.0</b> (actuelle : 2.11.3)" in text and "<b>3.0.1</b> — nouvelle version majeure" in text
+    sed = next(l for l in text.splitlines() if "sed -i" in l and "&amp;&amp;" not in l)
+    cmd = sed.split("<code>")[1].split("</code>")[0].replace("&amp;", "&").replace("&#x27;", "'")
+    subprocess.run(cmd, shell=True, check=True)
+    assert "image: 'jc21/nginx-proxy-manager:2.16.0'" in (tmp_path / "docker-compose.yml").read_text()
+    assert "docker compose pull npm" in text
+
+
+def test_third_party_tag_updated_or_nothing_published():
+    text = _npm_text(_npm_ctx(), {"tag": "latest", "tag_updated": True})
+    assert "Nouvelle image publiée pour le tag latest" in text
     assert text.count("<blockquote expandable>") == 1
     assert "<code>cd /home/ubuntu/proxy_manager &amp;&amp; docker compose pull npm" in text
+    text = _npm_text(_npm_ctx(), {"tag": "latest", "tag_updated": False})
+    assert "Aucune version plus récente publiée" in text and "docker compose pull" not in text
+
+
+def test_third_party_without_registry_info_gives_generic_advice():
+    text = _npm_text(_npm_ctx(), None)
+    assert "docker compose pull npm" in text and "aucune image corrigée" in text
     assert remedy._tag("postgres:16") == "16" and remedy._tag("sha256:abc") is None
 
 

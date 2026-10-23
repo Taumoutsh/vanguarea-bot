@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import asdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -13,7 +14,8 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, Defaults, filters
 
 from . import __version__
-from .checks import cleanup, cve, docker_check, exploit_guard, integrity, kev, network, remedy, ssh, system, web
+from .checks import (cleanup, cve, docker_check, exploit_guard, integrity, kev, network, registry, remedy, ssh,
+                     system, web)
 from .config import Config, load_config
 from .state import WARNING, Alert, AlertManager, State
 from .utils import chunk_message, esc, human_bytes, human_duration
@@ -123,11 +125,32 @@ class Monitor:
                 contexts = {}
             # Les scans planifiés sont silencieux : seules les failles activement exploitées
             # déclenchent une alerte immédiate. Le reste est résumé dans le rapport quotidien.
+            await asyncio.to_thread(self._check_image_updates, results, contexts)
             alerts = await asyncio.to_thread(exploit_guard.check, cfg, self.state, results, contexts, kev_db)
             await self.dispatch(app, "kev", alerts)
             if not scheduled:
                 duration = human_duration(time.time() - started)
                 await self.reply(update, cve.format_results(results, "Scan des CVE") + f"\n\n⏱ Durée : {duration}")
+
+    def _check_image_updates(self, results: list[cve.TargetResult], contexts: dict) -> None:
+        """Pour chaque image tierce vulnérable, cherche une version plus récente sur son registre."""
+        updates: dict[str, dict] = {}
+        for r in results:
+            ctxs = contexts.get(r.target) or []
+            if not r.vulns or not ctxs or ctxs[0].built:
+                continue
+            update = registry.check_image(self.cfg, r.target)
+            if update:
+                ctx = ctxs[0]
+                label = f"{ctx.project} / {ctx.service}" if ctx.project else ctx.container
+                updates[r.target] = {**asdict(update), "label": label, "cves": len(r.vulns)}
+        with self.state.lock:
+            self.state.section("cve")["image_updates"] = updates
+            self.state.save()
+
+    def image_updates(self) -> dict[str, dict]:
+        with self.state.lock:
+            return dict(self.state.data.get("cve", {}).get("image_updates", {}))
 
     async def fix_advice(self, results: list[cve.TargetResult], project: str | None = None) -> list[str]:
         try:
@@ -135,7 +158,7 @@ class Monitor:
         except Exception:  # noqa: BLE001 - sans Docker, on donne quand même les correctifs de l'hôte
             log.exception("Contexte des images indisponible")
             contexts = {}
-        return await asyncio.to_thread(remedy.advise, self.cfg, results, contexts, project)
+        return await asyncio.to_thread(remedy.advise, self.cfg, results, contexts, project, self.image_updates())
 
     async def job_daily_report(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = await self.build_report(update_baseline=True)
@@ -189,6 +212,19 @@ class Monitor:
     def cve_report(self, update_baseline: bool) -> str:
         """Résumé du dernier scan + CVE apparues ou corrigées depuis le rapport quotidien précédent."""
         lines = [self.cve_summary()]
+        updates = [u for u in self.image_updates().values()
+                   if u.get("tag_updated") or u.get("newer_minor") or u.get("newer_major")]
+        if updates:
+            lines += ["", "⬆️ <b>Images vulnérables avec une version plus récente</b>"]
+            for u in sorted(updates, key=lambda u: u["label"]):
+                if u.get("newer_minor") or u.get("newer_major"):
+                    target = u.get("newer_minor") or u.get("newer_major")
+                    major = "" if u.get("newer_minor") else " (majeure)"
+                    lines.append(f"• {esc(u['label'])} : {esc(u['tag'])} → <b>{esc(target)}</b>{major} "
+                                 f"— {u['cves']} CVE")
+                else:
+                    lines.append(f"• {esc(u['label'])} : nouvelle image « {esc(u['tag'])} » publiée — {u['cves']} CVE")
+            lines.append("Commandes : /fix")
         new, fixed, first = cve.report_diff(self.state, update_baseline)
         if first:
             lines.append("<i>Première référence établie : les nouvelles CVE seront signalées "

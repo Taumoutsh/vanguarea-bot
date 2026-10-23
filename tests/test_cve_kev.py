@@ -93,3 +93,19 @@ def test_kev_cache_used_when_download_fails(tmp_path):
     os.utime(cache, (old, old))
     assert set(kev.load(cfg)) == {"CVE-1"}
     assert kev.load(cfg_for(Path(tmp_path / "vide"), kev_url="http://127.0.0.1:9/x")) == {}
+
+
+def test_registry_parse_ref_and_newer_versions():
+    from vanguarea_bot.checks import registry
+
+    assert registry.parse_ref("postgres:16") == ("registry-1.docker.io", "library/postgres", "16")
+    assert registry.parse_ref("jc21/nginx-proxy-manager") == ("registry-1.docker.io", "jc21/nginx-proxy-manager",
+                                                               "latest")
+    assert registry.parse_ref("ghcr.io/org/app:v1.2") == ("ghcr.io", "org/app", "v1.2")
+    assert registry.parse_ref("localhost:5000/app:1") == ("localhost:5000", "app", "1")
+    assert registry.parse_ref("sha256:abc") is None
+    tags = ["16.1-alpine", "16.4-alpine", "16.4", "17.0-alpine", "16.5-rc1-alpine", "latest", "16.10-alpine"]
+    assert registry.newer_versions("16.2-alpine", tags) == ("16.10-alpine", "17.0-alpine")
+    assert registry.newer_versions("latest", tags) == (None, None)
+    assert registry.with_tag("ghcr.io/org/app:v1.2", "v1.3") == "ghcr.io/org/app:v1.3"
+    assert registry.with_tag("localhost:5000/app", "2") == "localhost:5000/app:2"

@@ -101,7 +101,11 @@ Le bot reste **en lecture seule** : il ne modifie jamais votre code ni vos conte
   - les paquets système à corriger : reconstruction avec `--pull`, ou version du `FROM` à monter ;
   - les dépendances à mettre à jour : `npm install pkg@^x.y.z` (ou `overrides` pour les dépendances indirectes), lignes `requirements.txt`, `go get`, version de Go pour la stdlib ;
   - les commandes `git commit`/`git push` et `docker compose build`/`up -d` du service concerné.
-- **Image tierce** (postgres, nginx…) : `docker compose pull` + `up -d`, ou monter le tag s'il est figé.
+- **Image tierce** (postgres, nginx…) : le bot interroge son registre public (Docker Hub, ghcr.io, quay.io…) :
+  - tag versionné (`2.11.3`, `16.4-alpine`) : version supérieure de même forme, en distinguant la même version majeure d'une nouvelle majeure, avec la commande `sed` qui modifie le tag dans le docker-compose.yml puis `pull` + `up -d` ;
+  - tag mobile (`latest`, `16`) : nouvelle image publiée sous ce tag (digest différent) → `pull` + `up -d` ;
+  - sinon : « aucune version plus récente publiée », rien à faire pour l'instant.
+  Le rapport quotidien liste les images vulnérables pour lesquelles une version plus récente existe.
 
 La version proposée est la plus petite version corrigée dans la même version majeure, pour limiter les risques de régression.
 

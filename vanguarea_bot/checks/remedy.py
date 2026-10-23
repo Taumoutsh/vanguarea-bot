@@ -14,6 +14,7 @@ from pathlib import Path
 from ..config import Config
 from ..utils import copy_steps as _steps, esc, run_host_cmd
 from .cve import TargetResult, Vuln
+from . import registry
 from .docker_check import ImageContext
 
 APT_FAMILY = {"debian", "ubuntu"}
@@ -496,7 +497,77 @@ def _tag(ref: str) -> str | None:
     return name.split(":", 1)[1] if ":" in name else "latest"
 
 
-def advise_image(cfg: Config, result: TargetResult, contexts: list[ImageContext]) -> str:
+def _compose_file_with(cfg: Config, ctx: ImageContext, ref: str) -> str | None:
+    """Fichier docker-compose (vu depuis l'hôte) qui référence cette image."""
+    for path in (ctx.config_files or "").split(","):
+        path = path.strip()
+        try:
+            if path and ref in cfg.host_path(path).read_text(errors="replace"):
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def third_party_advice(cfg: Config, result: TargetResult, ctx: ImageContext, svc: str,
+                       update: dict | None) -> list[str]:
+    """Image tierce (postgres, nginx...) : le correctif passe par une version plus récente de l'image."""
+    ref = result.target
+    n = len(result.vulns)
+    lines = ["", f"Image tierce — <b>{n} CVE</b>."]
+    if ctx.project:
+        pull = [f"docker compose pull {svc}", f"docker compose up -d {svc}"]
+        cd = [f"cd {ctx.workdir}"]
+    else:
+        pull, cd = [f"docker pull {ref}"], []
+    recreate = [] if ctx.project else [f"puis recréer le conteneur <code>{esc(ctx.container)}</code>."]
+    update = update or {}
+    newer_minor, newer_major = update.get("newer_minor"), update.get("newer_major")
+    tag = update.get("tag") or _tag(ref) or "?"
+
+    if newer_minor or newer_major:
+        lines += ["", "🆕 <b>Version plus récente publiée</b>"]
+        if newer_minor:
+            lines.append(f"• <b>{esc(newer_minor)}</b> (actuelle : {esc(tag)}) — même version majeure")
+        if newer_major:
+            lines.append(f"• <b>{esc(newer_major)}</b> — nouvelle version majeure : lisez les notes de version "
+                         "(migration possible, ex. bases de données)")
+        chosen = newer_minor or newer_major
+        new_ref = registry.with_tag(ref, chosen)
+        lines += ["", f"🔧 <b>Passer à {esc(chosen)}</b>"]
+        compose_file = _compose_file_with(cfg, ctx, ref) if ctx.project else None
+        if compose_file:
+            old_re = re.sub(r"([.\[\]*^$\\#])", r"\\\1", ref)  # caractères spéciaux d'une regex sed
+            sed = f"sed -i 's#{old_re}#{new_ref}#' {shlex.quote(compose_file)}"
+            lines += _steps(cd + [sed] + pull)
+        else:
+            lines.append(f"Remplacez <code>{esc(ref)}</code> par <code>{esc(new_ref)}</code> "
+                         "dans le docker-compose.yml, puis :")
+            lines += _steps(cd + pull if ctx.project else [f"docker pull {new_ref}"])
+        lines += recreate
+        if update.get("tag_updated"):
+            lines.append(f"<i>Le tag actuel ({esc(tag)}) a aussi reçu une nouvelle image : un simple pull "
+                         "corrige peut-être déjà ces CVE.</i>")
+        lines.append("<i>Relancez /cve après la mise à jour pour vérifier que les CVE ont disparu.</i>")
+    elif update.get("tag_updated"):
+        lines += ["", f"🆕 <b>Nouvelle image publiée pour le tag {esc(tag)}</b>", "🔧 <b>Mettre à jour</b>",
+                  *_steps(cd + pull), *recreate,
+                  "<i>Relancez /cve après la mise à jour pour vérifier que les CVE ont disparu.</i>"]
+    elif update.get("tag_updated") is False or (update and not update.get("error") and _tag(ref) != "latest"):
+        lines += ["", f"⏳ <b>Aucune version plus récente publiée</b> pour {esc(tag)} : l'éditeur n'a pas encore "
+                      "sorti de correctif. Rien à faire pour l'instant, le bot vous le signalera."]
+    else:
+        # Registre injoignable ou privé : conseil générique.
+        lines += ["", "🔧 <b>Mettre à jour</b>", *_steps(cd + pull), *recreate]
+        if update.get("error"):
+            lines.append(f"<i>Registre non consultable ({esc(update['error'])}).</i>")
+        lines.append("<i>Si les CVE persistent après la mise à jour, aucune image corrigée n'est encore publiée, "
+                     "ou le tag est figé : montez-le dans le docker-compose.yml.</i>")
+    return lines
+
+
+def advise_image(cfg: Config, result: TargetResult, contexts: list[ImageContext],
+                 update: dict | None = None) -> str:
     ctx = contexts[0] if contexts else None
     services = sorted({c.service for c in contexts if c.service})
     label = f"{ctx.project} / {', '.join(services)}" if ctx and ctx.project else result.target
@@ -508,22 +579,7 @@ def advise_image(cfg: Config, result: TargetResult, contexts: list[ImageContext]
     svc = " ".join(services)
 
     if ctx and not ctx.built:
-        # Image tierce (postgres, nginx, redis...) : il faut une version plus récente de l'image.
-        n = len(result.vulns)
-        lines += ["", f"Image tierce — <b>{n} CVE</b> corrigée{'s' if n > 1 else ''} dans une version plus récente.",
-                  "", "🔧 <b>Mettre à jour</b>"]
-        if ctx.project:
-            lines += _steps([f"cd {ctx.workdir}", f"docker compose pull {svc}", f"docker compose up -d {svc}"])
-        else:
-            lines += _steps([f"docker pull {result.target}"])
-            lines.append(f"puis recréer le conteneur <code>{esc(ctx.container)}</code>.")
-        if _tag(result.target) == "latest":
-            lines.append("<i>Si les CVE persistent après la mise à jour, l'éditeur n'a pas encore publié "
-                         "d'image corrigée : réessayez plus tard.</i>")
-        else:
-            lines.append("<i>Si les CVE persistent après la mise à jour, la version est figée par le tag : "
-                         "montez-la dans le docker-compose.yml.</i>")
-        return "\n".join(lines)
+        return "\n".join(lines + third_party_advice(cfg, result, ctx, svc, update))
 
     if os_vulns:
         by_type: dict[str, list[Vuln]] = defaultdict(list)
@@ -555,7 +611,7 @@ def advise_image(cfg: Config, result: TargetResult, contexts: list[ImageContext]
 
 
 def advise(cfg: Config, results: list[TargetResult], contexts: dict[str, list[ImageContext]],
-           project: str | None = None) -> list[str]:
+           project: str | None = None, updates: dict[str, dict] | None = None) -> list[str]:
     """Correctifs pour tous les résultats (ou un seul projet), un message par cible."""
     blocks = []
     for r in results:
@@ -568,7 +624,7 @@ def advise(cfg: Config, results: list[TargetResult], contexts: dict[str, list[Im
         ctxs = contexts.get(r.target, [])
         if project and not any(project in (c.project, c.service, c.container) for c in ctxs) and project != r.target:
             continue
-        blocks.append(advise_image(cfg, r, ctxs))
+        blocks.append(advise_image(cfg, r, ctxs, (updates or {}).get(r.target)))
     if not blocks:
         return ["✅ Aucun correctif à appliquer" + (f" pour <b>{esc(project)}</b>." if project else ".")]
     header = ("🛠 <b>Correctifs à appliquer</b>\n\n"

@@ -133,6 +133,7 @@ class ImageContext:
     service: str | None
     workdir: str | None
     built: bool
+    config_files: str | None = None  # fichiers docker-compose (séparés par des virgules)
 
 
 def image_contexts(cfg: Config) -> dict[str, list[ImageContext]]:
@@ -151,6 +152,7 @@ def image_contexts(cfg: Config) -> dict[str, list[ImageContext]]:
                 workdir=labels.get("com.docker.compose.project.working_dir"),
                 # Une image construite localement n'a pas de digest de registre.
                 built=not image.attrs.get("RepoDigests"),
+                config_files=labels.get("com.docker.compose.project.config_files"),
             ))
         return out
     finally:
