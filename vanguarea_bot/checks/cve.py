@@ -36,6 +36,7 @@ class Vuln:
     cls: str = ""  # "os-pkgs" ou "lang-pkgs"
     pkg_type: str = ""  # debian, npm, node-pkg, pip, python-pkg, gomod, gobinary...
     path: str = ""  # fichier concerné dans l'image (lockfile, METADATA, binaire...)
+    exploited: bool = False  # présente dans le catalogue CISA KEV (exploitée activement)
 
 
 @dataclass
@@ -66,9 +67,14 @@ def parse_trivy_json(raw: str) -> list[Vuln]:
     return list(vulns.values())
 
 
+# On analyse toutes les sévérités : une CVE « HIGH » ou « MEDIUM » activement exploitée est plus urgente
+# qu'une « CRITICAL » théorique. Le filtrage selon CVE_SEVERITIES se fait ensuite (voir reportable).
+ALL_SEVERITIES = "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
+
+
 def _scan_args(cfg: Config) -> list[str]:
     args = ["--quiet", "--cache-dir", cfg.trivy_cache_dir, "--format", "json", "--scanners", "vuln",
-            "--severity", ",".join(cfg.cve_severities), "--timeout", f"{cfg.cve_timeout}s"]
+            "--severity", ALL_SEVERITIES, "--timeout", f"{cfg.cve_timeout}s"]
     if cfg.cve_ignore_unfixed:
         args.append("--ignore-unfixed")
     return args
@@ -122,33 +128,64 @@ def scan_all(cfg: Config) -> list[TargetResult]:
     return results
 
 
-def record_and_diff(results: list[TargetResult], state: State) -> list[TargetResult]:
-    """Enregistre le scan et retourne uniquement les vulnérabilités nouvelles."""
+def mark_exploited(results: list[TargetResult], kev: dict[str, dict]) -> None:
+    for r in results:
+        for v in r.vulns:
+            v.exploited = v.cve in kev
+
+
+def reportable(results: list[TargetResult], cfg: Config) -> list[TargetResult]:
+    """Garde les sévérités configurées (CVE_SEVERITIES) et, toujours, les CVE activement exploitées."""
+    return [TargetResult(r.target, [v for v in r.vulns if v.severity in cfg.cve_severities or v.exploited], r.error)
+            for r in results]
+
+
+def record(results: list[TargetResult], state: State) -> None:
+    """Enregistre le dernier scan (utilisé par /fix et par le rapport)."""
     with state.lock:
         cve_state = state.section("cve")
-        seen = set(cve_state.get("seen", []))
-        current: set[str] = set()
-        new_results = []
-        for r in results:
-            new = []
-            for v in r.vulns:
-                key = f"{r.target}|{v.pkg}|{v.cve}"
-                current.add(key)
-                if key not in seen:
-                    new.append(v)
-            if new:
-                new_results.append(TargetResult(r.target, new))
-        # On ne garde que ce qui est encore présent : une CVE corrigée puis réintroduite sera re-signalée.
-        cve_state["seen"] = sorted(current)
+        cve_state.pop("seen", None)  # ancien format
         cve_state["last_scan"] = time.time()
         cve_state["last_summary"] = {
             r.target: {"error": r.error, "count": len(r.vulns),
-                       "critical": sum(1 for v in r.vulns if v.severity == "CRITICAL")}
+                       "critical": sum(1 for v in r.vulns if v.severity == "CRITICAL"),
+                       "exploited": sum(1 for v in r.vulns if v.exploited)}
             for r in results
         }
         cve_state["last_results"] = [asdict(r) for r in results]
         state.save()
-    return new_results
+
+
+def _key(target: str, v: Vuln) -> str:
+    return f"{target}|{v.pkg}|{v.cve}"
+
+
+def report_diff(state: State, update_baseline: bool) -> tuple[list[TargetResult], int, bool]:
+    """CVE apparues depuis le dernier rapport quotidien (et non depuis le dernier scan).
+
+    Retourne (nouvelles CVE, nombre de CVE corrigées ou disparues, premier rapport ?).
+    La référence n'est mise à jour que par le rapport quotidien (update_baseline=True).
+    """
+    current = last_results(state)
+    with state.lock:
+        cve_state = state.section("cve")
+        if not cve_state.get("last_scan"):
+            return [], 0, True  # pas encore de scan : rien à comparer, la référence reste vide
+        baseline_raw = cve_state.get("report_baseline")
+        # Une cible dont le dernier scan a échoué garde ses CVE précédentes (ni nouvelles, ni corrigées).
+        errored = {r.target for r in current if r.error}
+        current_keys = {_key(r.target, v) for r in current if not r.error for v in r.vulns}
+        baseline = set(baseline_raw or [])
+        kept = {k for k in baseline if k.split("|", 1)[0] in errored}
+        if update_baseline:
+            cve_state["report_baseline"] = sorted(current_keys | kept)
+            state.save()
+    if baseline_raw is None:
+        return [], 0, True
+    new = [TargetResult(r.target, [v for v in r.vulns if _key(r.target, v) not in baseline])
+           for r in current if not r.error]
+    fixed = len(baseline - kept - current_keys)
+    return [r for r in new if r.vulns], fixed, False
 
 
 def last_results(state: State) -> list[TargetResult]:
@@ -173,9 +210,11 @@ def format_results(results: list[TargetResult], title: str, max_per_target: int 
         by_pkg: dict[tuple[str, str, str], list[Vuln]] = defaultdict(list)
         for v in r.vulns:
             by_pkg[(v.pkg, v.installed, v.fixed)].append(v)
-        ordered = sorted(by_pkg.items(), key=lambda kv: (-sum(v.severity == "CRITICAL" for v in kv[1]), kv[0][0]))
+        ordered = sorted(by_pkg.items(), key=lambda kv: (-any(v.exploited for v in kv[1]),
+                                                           -sum(v.severity == "CRITICAL" for v in kv[1]), kv[0][0]))
         for (pkg, installed, fixed), vulns in ordered[:max_per_target]:
-            icon = "🔴" if any(v.severity == "CRITICAL" for v in vulns) else "🟠"
+            icon = ("🔥" if any(v.exploited for v in vulns)
+                    else "🔴" if any(v.severity == "CRITICAL" for v in vulns) else "🟠")
             fix = f"→ <b>{esc(fixed)}</b>" if fixed else "(pas de correctif)"
             cves = ", ".join(f'<a href="{esc(v.url)}">{esc(v.cve)}</a>' for v in vulns[:5])
             if len(vulns) > 5:
@@ -183,6 +222,9 @@ def format_results(results: list[TargetResult], title: str, max_per_target: int 
             lines.append(f"{icon} <code>{esc(pkg)}</code> {esc(installed)} {fix}\n     {cves}")
         if len(ordered) > max_per_target:
             lines.append(f"   … et {len(ordered) - max_per_target} autre(s) paquet(s)")
+    if any(v.exploited for r in results for v in r.vulns):
+        lines.append("")
+        lines.append("🔥 = activement exploitée par des attaquants (catalogue CISA KEV) : à corriger en priorité")
     if any(r.vulns for r in results):
         lines.append("")
         lines.append("💡 /fix pour le correctif détaillé de chaque projet")

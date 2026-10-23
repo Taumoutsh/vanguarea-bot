@@ -13,7 +13,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, Defaults, filters
 
 from . import __version__
-from .checks import cleanup, cve, docker_check, integrity, network, remedy, ssh, system, web
+from .checks import cleanup, cve, docker_check, exploit_guard, integrity, kev, network, remedy, ssh, system, web
 from .config import Config, load_config
 from .state import WARNING, Alert, AlertManager, State
 from .utils import chunk_message, esc, human_bytes, human_duration
@@ -110,19 +110,24 @@ class Monitor:
             return
         async with self.cve_lock:
             started = time.time()
-            results = await asyncio.to_thread(cve.scan_all, self.cfg)
-            new = await asyncio.to_thread(cve.record_and_diff, results, self.state)
-            duration = human_duration(time.time() - started)
-            errors = [r for r in results if r.error]
-            if scheduled:
-                # Planifié : on ne remonte que les nouvelles CVE (et les erreurs), avec leurs correctifs.
-                if new or errors:
-                    await self.broadcast(app, cve.format_results(new + errors, "Nouvelles CVE détectées"))
-                for block in (await self.fix_advice(new) if new else []):
-                    await self.broadcast(app, block)
-            else:
-                text = cve.format_results(results, "Scan des CVE") + f"\n\n⏱ Durée : {duration}"
-                await self.reply(update, text)
+            cfg = self.cfg
+            results = await asyncio.to_thread(cve.scan_all, cfg)
+            kev_db = await asyncio.to_thread(kev.load, cfg)
+            cve.mark_exploited(results, kev_db)
+            results = cve.reportable(results, cfg)
+            await asyncio.to_thread(cve.record, results, self.state)
+            try:
+                contexts = await asyncio.to_thread(docker_check.image_contexts, cfg)
+            except Exception:  # noqa: BLE001 - sans Docker, seules les CVE de l'hôte sont traitées
+                log.exception("Contexte des images indisponible")
+                contexts = {}
+            # Les scans planifiés sont silencieux : seules les failles activement exploitées
+            # déclenchent une alerte immédiate. Le reste est résumé dans le rapport quotidien.
+            alerts = await asyncio.to_thread(exploit_guard.check, cfg, self.state, results, contexts, kev_db)
+            await self.dispatch(app, "kev", alerts)
+            if not scheduled:
+                duration = human_duration(time.time() - started)
+                await self.reply(update, cve.format_results(results, "Scan des CVE") + f"\n\n⏱ Durée : {duration}")
 
     async def fix_advice(self, results: list[cve.TargetResult], project: str | None = None) -> list[str]:
         try:
@@ -133,7 +138,7 @@ class Monitor:
         return await asyncio.to_thread(remedy.advise, self.cfg, results, contexts, project)
 
     async def job_daily_report(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        text = await self.build_report()
+        text = await self.build_report(update_baseline=True)
         await self.broadcast(context.application, text)
         self.state.reset_daily()
 
@@ -175,11 +180,29 @@ class Monitor:
             if info.get("error"):
                 lines.append(f"• {esc(target)} : ❌ erreur")
             else:
-                icon = "🔴" if info["count"] else "✅"
-                lines.append(f"• {icon} {esc(target)} : {info['count']}")
+                exploited = info.get("exploited", 0)
+                icon = "🔥" if exploited else "🔴" if info["count"] else "✅"
+                extra = f" (dont <b>{exploited} exploitée(s)</b>)" if exploited else ""
+                lines.append(f"• {icon} {esc(target)} : {info['count']}{extra}")
         return "\n".join(lines)
 
-    async def build_report(self) -> str:
+    def cve_report(self, update_baseline: bool) -> str:
+        """Résumé du dernier scan + CVE apparues ou corrigées depuis le rapport quotidien précédent."""
+        lines = [self.cve_summary()]
+        new, fixed, first = cve.report_diff(self.state, update_baseline)
+        if first:
+            lines.append("<i>Première référence établie : les nouvelles CVE seront signalées "
+                         "à partir du prochain rapport.</i>")
+            return "\n".join(lines)
+        if fixed:
+            lines.append(f"✅ <b>{fixed}</b> CVE corrigée(s) ou disparue(s) depuis le dernier rapport")
+        if new:
+            lines += ["", cve.format_results(new, "🆕 Nouvelles CVE depuis le dernier rapport", max_per_target=5)]
+        else:
+            lines.append("🆕 Aucune nouvelle CVE depuis le dernier rapport")
+        return "\n".join(lines)
+
+    async def build_report(self, update_baseline: bool = False) -> str:
         cfg = self.cfg
         sys_status = await asyncio.to_thread(system.collect, cfg)
         parts = [f"📋 <b>Rapport quotidien</b> — {datetime.now(ZoneInfo(cfg.timezone)).strftime('%d/%m/%Y %H:%M')}",
@@ -200,7 +223,7 @@ class Monitor:
             parts.append(f"🧹 <b>{human_bytes(safe)}</b> récupérables sans risque "
                          f"({human_bytes(total)} au total) : /cleanup")
         parts.append(await asyncio.to_thread(self.security_summary))
-        parts.append(self.cve_summary())
+        parts.append(self.cve_report(update_baseline))
         return "\n\n".join(parts)
 
     # --------------------------------------------------------------- commandes
@@ -286,8 +309,11 @@ class Monitor:
     async def on_startup(self, app: Application) -> None:
         await app.bot.set_my_commands([BotCommand(n, d) for n, d in COMMANDS])
         trivy = "✅" if cve.trivy_available(self.cfg) else "❌ (scan CVE désactivé)"
+        stop = "activé" if self.cfg.auto_stop_exploited else "désactivé (AUTO_STOP_EXPLOITED)"
         await self.broadcast(app, f"🤖 <b>Vanguarea démarré</b> v{__version__}\n"
-                                  f"Surveillance active. Trivy : {trivy}\n/help pour les commandes.")
+                                  f"Surveillance active. Trivy : {trivy}\n"
+                                  f"Scan CVE toutes les {self.cfg.cve_scan_interval:g} h, "
+                                  f"arrêt auto des failles exploitées : {stop}\n/help pour les commandes.")
 
     def build_app(self) -> Application:
         cfg = self.cfg
@@ -311,7 +337,7 @@ class Monitor:
         jq = app.job_queue
         jq.run_repeating(self.job_system, interval=cfg.check_interval, first=15, name="system")
         jq.run_repeating(self.job_security, interval=cfg.security_interval, first=10, name="security")
-        jq.run_daily(self.job_cve, time=cfg.cve_scan_time.replace(tzinfo=tz), name="cve")
+        jq.run_repeating(self.job_cve, interval=cfg.cve_scan_interval * 3600, first=300, name="cve")
         jq.run_daily(self.job_daily_report, time=cfg.daily_report_time.replace(tzinfo=tz), name="report")
         return app
 

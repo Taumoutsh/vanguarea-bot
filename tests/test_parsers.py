@@ -78,8 +78,8 @@ def test_trivy_parse_and_diff(tmp_path):
     assert vulns[0].cve == "CVE-2024-0001" and vulns[0].fixed == "3.0.2"
     state = State(tmp_path / "s.json")
     results = [cve.TargetResult("hôte", vulns)]
-    assert len(cve.record_and_diff(results, state)) == 1
-    assert cve.record_and_diff(results, state) == []
+    cve.record(results, state)
+    assert cve.last_results(state)[0].vulns[0].cve == "CVE-2024-0001"
     assert "openssl" in cve.format_results(results, "Scan")
 
 

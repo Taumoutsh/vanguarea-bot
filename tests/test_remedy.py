@@ -110,7 +110,7 @@ def test_own_go_project_single_go_get_and_roundtrip(tmp_path: Path):
                                 ("C2", "golang.org/x/net", "v0.17.0", "0.23.0"),
                                 ("C3", "golang.org/x/crypto", "v0.17.0", "0.31.0"),
                                 ("C4", "stdlib", "v1.21.0", "1.21.8")]]
-    cve.record_and_diff([cve.TargetResult("svc", vulns)], state)
+    cve.record([cve.TargetResult("svc", vulns)], state)
     loaded = cve.last_results(State(tmp_path / "s.json"))
     ctx = ImageContext("svc", "svc-1", "monapp", "api", str(tmp_path), built=True)
     text = remedy.advise(Config(token="x", chat_ids=frozenset({1})), loaded, {"svc": [ctx]})[1]

@@ -70,7 +70,7 @@ class Config:
     security_interval: int = 60
     alert_cooldown: int = 3600
     daily_report_time: time = time(8, 0)
-    cve_scan_time: time = time(6, 0)
+    cve_scan_interval: float = 6.0  # heures entre deux scans (silencieux, résumés dans le rapport quotidien)
 
     # Seuils système
     cpu_threshold: float = 90.0
@@ -91,6 +91,9 @@ class Config:
     cve_scan_host: bool = True
     cve_scan_images: bool = True
     cve_timeout: int = 3600
+    kev_url: str = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+    auto_stop_exploited: bool = False  # arrêter les conteneurs touchés par une CVE activement exploitée
+    auto_stop_exclude: tuple[str, ...] = ("vanguarea-bot",)
 
     # Sécurité
     ssh_fail_threshold: int = 15
@@ -133,7 +136,7 @@ def load_config() -> Config:
         security_interval=_int("SECURITY_INTERVAL", 60),
         alert_cooldown=_int("ALERT_COOLDOWN", 3600),
         daily_report_time=_time("DAILY_REPORT_TIME", "08:00"),
-        cve_scan_time=_time("CVE_SCAN_TIME", "06:00"),
+        cve_scan_interval=_float("CVE_SCAN_INTERVAL", 6),
         cpu_threshold=_float("CPU_THRESHOLD", 90),
         mem_threshold=_float("MEM_THRESHOLD", 90),
         swap_threshold=_float("SWAP_THRESHOLD", 80),
@@ -148,6 +151,9 @@ def load_config() -> Config:
         cve_scan_host=_bool("CVE_SCAN_HOST", True),
         cve_scan_images=_bool("CVE_SCAN_IMAGES", True),
         cve_timeout=_int("CVE_TIMEOUT", 3600),
+        kev_url=_env("KEV_URL", Config.kev_url),
+        auto_stop_exploited=_bool("AUTO_STOP_EXPLOITED", False),
+        auto_stop_exclude=tuple(_list("AUTO_STOP_EXCLUDE", "vanguarea-bot")),
         ssh_fail_threshold=_int("SSH_FAIL_THRESHOLD", 15),
         ssh_trusted_ips=tuple(_list("SSH_TRUSTED_IPS")),
         syn_recv_threshold=_int("SYN_RECV_THRESHOLD", 200),

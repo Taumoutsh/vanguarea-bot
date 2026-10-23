@@ -8,7 +8,7 @@ Bot Telegram qui surveille un VPS (OS, conteneurs Docker, CVE, attaques) et vous
 |---|---|---|
 | **OS** | CPU, RAM, swap, charge, disques et inodes, uptime, services systemd en échec, redémarrage requis, mises à jour (apt/dnf) dont sécurité, processus zombies, comptes UID 0 suspects | ✅ (seuils configurables) |
 | **Docker** | État de chaque conteneur, healthcheck, redémarrages, OOM kill, CPU/RAM | ✅ arrêt anormal, *unhealthy*, boucle de redémarrage, OOM |
-| **CVE** | Paquets de l'hôte (OS + dépendances applicatives) et images Docker en cours d'exécution, via [Trivy](https://trivy.dev) | ✅ scan quotidien, seules les **nouvelles** CVE sont signalées, **avec le correctif à appliquer** |
+| **CVE** | Paquets de l'hôte et images Docker en cours d'exécution, via [Trivy](https://trivy.dev), toutes les 6 h ; failles activement exploitées repérées grâce au catalogue [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) | ✅ immédiate pour une faille exploitée (avec arrêt optionnel du conteneur) ; nouvelles CVE depuis la veille dans le rapport quotidien |
 | **SSH** | Échecs d'authentification par IP, brute force distribué, connexions réussies, échecs `sudo` | ✅ |
 | **DDoS / flood** | SYN flood (connexions `SYN_RECV` + SYN cookies du noyau), trop de connexions depuis une IP, débit / paquets entrants anormaux | ✅ |
 | **Web** | Logs d'accès nginx/Apache/Caddy/Traefik : flood HTTP par IP, scans de vulnérabilités (`/.env`, `wp-login.php`, `../`, Log4Shell, injections SQL…) | ✅ (si `ACCESS_LOGS` est renseigné) |
@@ -83,6 +83,14 @@ Toutes les options sont dans [`.env.example`](.env.example) avec leurs valeurs p
 - `ACCESS_LOGS=/var/log/nginx/access.log` pour activer la détection d'attaques web. Pour un reverse proxy en conteneur, activez ses logs d'accès dans un fichier monté sur l'hôte (Traefik : `accesslog.filePath`, format texte ou JSON).
 - `SSH_TRUSTED_IPS` pour ne pas être notifié de vos propres connexions SSH.
 - `DOCKER_IGNORE` pour les conteneurs ponctuels.
+
+## Failles activement exploitées
+
+Les scans tournent toutes les `CVE_SCAN_INTERVAL` heures (6 par défaut) **sans envoyer de message**. Le rapport quotidien indique les CVE apparues et corrigées **depuis le rapport précédent** (pas depuis le scan précédent).
+
+Chaque CVE est comparée au catalogue [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) des failles exploitées par des attaquants (téléchargé au plus toutes les 12 h, copie locale en cas d'échec). Une telle CVE est signalée 🔥 et déclenche une alerte immédiate, quelle que soit sa sévérité.
+
+Avec `AUTO_STOP_EXPLOITED=true`, le bot **arrête uniquement les conteneurs dont l'image contient une CVE exploitée** — pas ceux qui n'ont « que » des CVE critiques — et envoie la commande pour les relancer. Les conteneurs listés dans `AUTO_STOP_EXCLUDE` (nom, service ou projet compose : le bot lui-même, un reverse proxy…) ne sont jamais arrêtés. Un conteneur relancé à la main n'est pas ré-arrêté pour les mêmes CVE, seulement si une nouvelle faille exploitée apparaît. Pour les failles du serveur lui-même, seule une alerte est envoyée.
 
 ## Corriger les CVE
 
