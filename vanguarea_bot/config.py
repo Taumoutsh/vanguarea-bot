@@ -98,6 +98,8 @@ class Config:
     # Sécurité
     ssh_fail_threshold: int = 15
     ssh_trusted_ips: tuple[str, ...] = ()
+    geoip_provider: str = "ipinfo"  # ipinfo (pays, ville, opérateur), rdap (sans ville, sans limite) ou none
+    ipinfo_token: str = ""
     syn_recv_threshold: int = 200
     conn_per_ip_threshold: int = 150
     rx_pps_threshold: int = 50_000
@@ -156,6 +158,8 @@ def load_config() -> Config:
         auto_stop_exclude=tuple(_list("AUTO_STOP_EXCLUDE", "vanguarea-bot")),
         ssh_fail_threshold=_int("SSH_FAIL_THRESHOLD", 15),
         ssh_trusted_ips=tuple(_list("SSH_TRUSTED_IPS")),
+        geoip_provider=(_env("GEOIP_PROVIDER", "ipinfo") or "ipinfo").lower(),
+        ipinfo_token=_env("IPINFO_TOKEN", ""),
         syn_recv_threshold=_int("SYN_RECV_THRESHOLD", 200),
         conn_per_ip_threshold=_int("CONN_PER_IP_THRESHOLD", 150),
         rx_pps_threshold=_int("RX_PPS_THRESHOLD", 50_000),

@@ -44,12 +44,12 @@ def test_ssh_parse_lines():
     ]
     ev = ssh.parse_lines(lines)
     assert ev.failures == {"1.2.3.4": 2, "5.6.7.8": 1}
-    assert ev.logins == [("sinan", "9.9.9.9", "publickey")]
+    assert ev.logins == [ssh.Login("sinan", "9.9.9.9", "publickey")]
     assert ev.sudo_failures == {"bob": 1}
 
 
 def test_ssh_bruteforce_alert(tmp_path, monkeypatch):
-    cfg = make_cfg(tmp_path, ssh_fail_threshold=3)
+    cfg = make_cfg(tmp_path, ssh_fail_threshold=3, geoip_provider="none")
     state = State(cfg.state_file)
     lines = [f"sshd[1]: Failed password for root from 1.2.3.4 port {i} ssh2" for i in range(5)]
     monkeypatch.setattr(ssh, "read_auth_lines", lambda c, s: lines)
