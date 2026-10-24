@@ -309,3 +309,15 @@ def test_packages_check_apt(monkeypatch, tmp_path):
                                       vuln("libxml2", "2.9.1", "2.9.9", cls="os-pkgs", pkg_type="ubuntu")])
     infos = packages.check(Config(token="x", chat_ids=frozenset({1})), [result])
     assert infos["apt:openssl"]["available"] is True and infos["apt:libxml2"]["available"] is False
+
+
+def test_third_party_plan_statuses(tmp_path):
+    cfg = Config(token="x", chat_ids=frozenset({1}))
+    ctx = _npm_ctx(tmp_path, tag="2.11.3")
+    assert remedy.third_party_plan(cfg, ctx.ref, ctx, "npm", {"newer_minor": "2.16.0"}).status == "newer"
+    assert remedy.third_party_plan(cfg, ctx.ref, ctx, "npm", {"tag": "2.11.3"}).status == "none"
+    latest = _npm_ctx()
+    assert remedy.third_party_plan(cfg, latest.ref, latest, "npm", {"tag_updated": True}).cmds[-1] == \
+        "docker compose up -d npm"
+    plan = remedy.third_party_plan(cfg, latest.ref, latest, "npm", {"error": "HTTP 429"})
+    assert plan.status == "unknown" and plan.cmds

@@ -18,7 +18,7 @@ from .checks import (cleanup, cve, docker_check, exploit_guard, integrity, kev, 
                      ssh, system, web)
 from .config import Config, load_config
 from .state import WARNING, Alert, AlertManager, State
-from .utils import chunk_message, esc, human_bytes, human_duration
+from .utils import chunk_message, copy_cmd, esc, human_bytes, human_duration
 
 log = logging.getLogger("vanguarea")
 
@@ -143,8 +143,12 @@ class Monitor:
             update = registry.check_image(self.cfg, r.target)
             if update:
                 ctx = ctxs[0]
-                label = f"{ctx.project} / {ctx.service}" if ctx.project else ctx.container
-                updates[r.target] = {**asdict(update), "label": label, "cves": len(r.vulns)}
+                services = " ".join(sorted({c.service for c in ctxs if c.service}))
+                info = asdict(update)
+                plan = remedy.third_party_plan(self.cfg, r.target, ctx, services, info)
+                label = f"{ctx.project} / {services}" if ctx.project else ctx.container
+                updates[r.target] = {**info, "label": label, "cves": len(r.vulns), "status": plan.status,
+                                     "command": " && ".join(plan.cmds), "manual": plan.manual}
         with self.state.lock:
             self.state.section("cve")["image_updates"] = updates
             self.state.save()
@@ -229,19 +233,31 @@ class Monitor:
     def cve_report(self, update_baseline: bool) -> str:
         """Résumé du dernier scan + CVE apparues ou corrigées depuis le rapport quotidien précédent."""
         lines = [self.cve_summary()]
-        updates = [u for u in self.image_updates().values()
-                   if u.get("tag_updated") or u.get("newer_minor") or u.get("newer_major")]
+        updates = sorted(self.image_updates().values(), key=lambda u: u["label"])
         if updates:
-            lines += ["", "⬆️ <b>Images vulnérables avec une version plus récente</b>"]
-            for u in sorted(updates, key=lambda u: u["label"]):
-                if u.get("newer_minor") or u.get("newer_major"):
+            lines += ["", "🐳 <b>Images tierces vulnérables</b>"]
+            for u in updates:
+                status = u.get("status")
+                head = f"• <b>{esc(u['label'])}</b> ({esc(u['tag'])}) — {u['cves']} CVE"
+                if status == "newer":
                     target = u.get("newer_minor") or u.get("newer_major")
-                    major = "" if u.get("newer_minor") else " (majeure)"
-                    lines.append(f"• {esc(u['label'])} : {esc(u['tag'])} → <b>{esc(target)}</b>{major} "
-                                 f"— {u['cves']} CVE")
+                    major = "" if u.get("newer_minor") else " (version majeure : lisez les notes de version)"
+                    lines.append(f"{head}\n  ⬆️ Version <b>{esc(target)}</b> disponible{major}")
+                elif status == "tag_updated":
+                    lines.append(f"{head}\n  ⬆️ Nouvelle image publiée pour ce tag")
+                elif status == "none":
+                    lines.append(f"{head}\n  ⏳ Aucune version plus récente publiée : rien à faire pour l'instant")
+                    continue
                 else:
-                    lines.append(f"• {esc(u['label'])} : nouvelle image « {esc(u['tag'])} » publiée — {u['cves']} CVE")
-            lines.append("Commandes : /fix")
+                    reason = f" ({esc(u['error'])})" if u.get("error") else ""
+                    lines.append(f"{head}\n  ❔ Version plus récente non vérifiable{reason} : essayez une mise à jour")
+                if u.get("manual"):
+                    old, new = u["manual"].split(" → ")
+                    lines.append(f"  Remplacez <code>{esc(old)}</code> par <code>{esc(new)}</code> dans le "
+                                 "docker-compose.yml, puis :")
+                if u.get("command"):
+                    lines.append("  " + copy_cmd(u["command"]))
+            lines.append("<i>Détails : /fix</i>")
         pkgs = self.package_updates().values()
         apt_ready = sum(1 for p in pkgs if p["ecosystem"] == "apt" and p.get("available"))
         apt_waiting = [p["name"] for p in pkgs if p["ecosystem"] == "apt" and p.get("available") is False]

@@ -554,56 +554,75 @@ def _compose_file_with(cfg: Config, ctx: ImageContext, ref: str) -> str | None:
     return None
 
 
-def third_party_advice(cfg: Config, result: TargetResult, ctx: ImageContext, svc: str,
-                       update: dict | None) -> list[str]:
-    """Image tierce (postgres, nginx...) : le correctif passe par une version plus récente de l'image."""
-    ref = result.target
-    n = len(result.vulns)
-    lines = ["", f"Image tierce — <b>{n} CVE</b>."]
-    if ctx.project:
-        pull = [f"docker compose pull {svc}", f"docker compose up -d {svc}"]
-        cd = [f"cd {ctx.workdir}"]
-    else:
-        pull, cd = [f"docker pull {ref}"], []
-    recreate = [] if ctx.project else [f"puis recréer le conteneur <code>{esc(ctx.container)}</code>."]
-    update = update or {}
-    newer_minor, newer_major = update.get("newer_minor"), update.get("newer_major")
-    tag = update.get("tag") or _tag(ref) or "?"
+@dataclass
+class ThirdPartyPlan:
+    status: str  # "newer" (version supérieure), "tag_updated", "none" (rien de publié), "unknown"
+    cmds: list[str]  # commandes à lancer (vide si rien à faire)
+    tag: str
+    chosen: str | None = None  # version cible pour « newer »
+    manual: str | None = None  # remplacement à faire à la main si le fichier compose n'est pas trouvé
 
-    if newer_minor or newer_major:
-        lines += ["", "🆕 <b>Version plus récente publiée</b>"]
-        if newer_minor:
-            lines.append(f"• <b>{esc(newer_minor)}</b> (actuelle : {esc(tag)}) — même version majeure")
-        if newer_major:
-            lines.append(f"• <b>{esc(newer_major)}</b> — nouvelle version majeure : lisez les notes de version "
-                         "(migration possible, ex. bases de données)")
-        chosen = newer_minor or newer_major
+
+def third_party_plan(cfg: Config, ref: str, ctx: ImageContext, svc: str, update: dict | None) -> ThirdPartyPlan:
+    """Ce qu'il faut faire pour une image tierce vulnérable, d'après la vérification du registre."""
+    update = update or {}
+    tag = update.get("tag") or _tag(ref) or "?"
+    cd = [f"cd {ctx.workdir}"] if ctx.project else []
+    pull = [f"docker compose pull {svc}", f"docker compose up -d {svc}"] if ctx.project else [f"docker pull {ref}"]
+    chosen = update.get("newer_minor") or update.get("newer_major")
+    if chosen:
         new_ref = registry.with_tag(ref, chosen)
-        lines += ["", f"🔧 <b>Passer à {esc(chosen)}</b>"]
         compose_file = _compose_file_with(cfg, ctx, ref) if ctx.project else None
         if compose_file:
             old_re = re.sub(r"([.\[\]*^$\\#])", r"\\\1", ref)  # caractères spéciaux d'une regex sed
             sed = f"sed -i 's#{old_re}#{new_ref}#' {shlex.quote(compose_file)}"
-            lines += _steps(cd + [sed] + pull)
-        else:
-            lines.append(f"Remplacez <code>{esc(ref)}</code> par <code>{esc(new_ref)}</code> "
+            return ThirdPartyPlan("newer", cd + [sed] + pull, tag, chosen)
+        cmds = cd + pull if ctx.project else [f"docker pull {new_ref}"]
+        return ThirdPartyPlan("newer", cmds, tag, chosen, manual=f"{ref} → {new_ref}")
+    if update.get("tag_updated"):
+        return ThirdPartyPlan("tag_updated", cd + pull, tag)
+    if update.get("tag_updated") is False or (update and not update.get("error") and _tag(ref) != "latest"):
+        return ThirdPartyPlan("none", [], tag)
+    return ThirdPartyPlan("unknown", cd + pull, tag)
+
+
+def third_party_advice(cfg: Config, result: TargetResult, ctx: ImageContext, svc: str,
+                       update: dict | None) -> list[str]:
+    """Image tierce (postgres, nginx...) : le correctif passe par une version plus récente de l'image."""
+    update = update or {}
+    plan = third_party_plan(cfg, result.target, ctx, svc, update)
+    n = len(result.vulns)
+    lines = ["", f"Image tierce — <b>{n} CVE</b>."]
+    recreate = [] if ctx.project else [f"puis recréer le conteneur <code>{esc(ctx.container)}</code>."]
+    verify = "<i>Relancez /cve après la mise à jour pour vérifier que les CVE ont disparu.</i>"
+
+    if plan.status == "newer":
+        newer_minor, newer_major = update.get("newer_minor"), update.get("newer_major")
+        lines += ["", "🆕 <b>Version plus récente publiée</b>"]
+        if newer_minor:
+            lines.append(f"• <b>{esc(newer_minor)}</b> (actuelle : {esc(plan.tag)}) — même version majeure")
+        if newer_major:
+            lines.append(f"• <b>{esc(newer_major)}</b> — nouvelle version majeure : lisez les notes de version "
+                         "(migration possible, ex. bases de données)")
+        lines += ["", f"🔧 <b>Passer à {esc(plan.chosen)}</b>"]
+        if plan.manual:
+            old, new = plan.manual.split(" → ")
+            lines.append(f"Remplacez <code>{esc(old)}</code> par <code>{esc(new)}</code> "
                          "dans le docker-compose.yml, puis :")
-            lines += _steps(cd + pull if ctx.project else [f"docker pull {new_ref}"])
-        lines += recreate
+        lines += [*_steps(plan.cmds), *recreate]
         if update.get("tag_updated"):
-            lines.append(f"<i>Le tag actuel ({esc(tag)}) a aussi reçu une nouvelle image : un simple pull "
+            lines.append(f"<i>Le tag actuel ({esc(plan.tag)}) a aussi reçu une nouvelle image : un simple pull "
                          "corrige peut-être déjà ces CVE.</i>")
-        lines.append("<i>Relancez /cve après la mise à jour pour vérifier que les CVE ont disparu.</i>")
-    elif update.get("tag_updated"):
-        lines += ["", f"🆕 <b>Nouvelle image publiée pour le tag {esc(tag)}</b>", "🔧 <b>Mettre à jour</b>",
-                  *_steps(cd + pull), *recreate,
-                  "<i>Relancez /cve après la mise à jour pour vérifier que les CVE ont disparu.</i>"]
-    elif update.get("tag_updated") is False or (update and not update.get("error") and _tag(ref) != "latest"):
-        lines += ["", f"⏳ <b>Aucune version plus récente publiée</b> pour {esc(tag)} : l'éditeur n'a pas encore "
-                      "sorti de correctif. Rien à faire pour l'instant, le bot vous le signalera."]
+        lines.append(verify)
+    elif plan.status == "tag_updated":
+        lines += ["", f"🆕 <b>Nouvelle image publiée pour le tag {esc(plan.tag)}</b>", "🔧 <b>Mettre à jour</b>",
+                  *_steps(plan.cmds), *recreate, verify]
+    elif plan.status == "none":
+        lines += ["", f"⏳ <b>Aucune version plus récente publiée</b> pour {esc(plan.tag)} : l'éditeur n'a pas "
+                      "encore sorti de correctif. Rien à faire pour l'instant, le bot vous le signalera."]
     else:
         # Registre injoignable ou privé : conseil générique.
-        lines += ["", "🔧 <b>Mettre à jour</b>", *_steps(cd + pull), *recreate]
+        lines += ["", "🔧 <b>Mettre à jour</b>", *_steps(plan.cmds), *recreate]
         if update.get("error"):
             lines.append(f"<i>Registre non consultable ({esc(update['error'])}).</i>")
         lines.append("<i>Si les CVE persistent après la mise à jour, aucune image corrigée n'est encore publiée, "
