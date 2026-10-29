@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from ..config import Config
 from ..logtail import read_new_lines
 from ..state import CRITICAL, INFO, WARNING, Alert, State
-from ..utils import esc, human_duration, run_host_cmd
+from ..utils import esc, run_host_cmd
 from . import geoip
 
 IP = r"(?P<ip>[0-9a-fA-F:.]+)"
@@ -158,35 +158,27 @@ def login_alert(cfg: Config, state: State, login: Login, now: float | None = Non
     if login.ip in cfg.ssh_trusted_ips:
         return None
 
-    level, title, notes = INFO, "Connexion SSH réussie", []
+    # Message volontairement court : l'utilisateur et la clé. Une situation anormale se lit dans le titre
+    # et le niveau de l'alerte (clé inconnue, mot de passe, root, pays jamais vu).
+    level, title = INFO, "Connexion SSH"
     if login.fingerprint:
         key = authorized_keys(cfg, login.user).get(login.fingerprint)
         if key:
-            who = f"avec la clé 🔑 <b>{esc(key[1] or 'sans commentaire')}</b> ({esc(login.key_type or key[0])})"
+            who = f"🔑 <b>{esc(key[1] or 'clé sans commentaire')}</b>"
         else:
-            level = WARNING
-            who = f"avec une <b>clé inconnue</b> 🔑 <code>{esc(login.fingerprint)}</code>"
-            notes.append("⚠️ Clé absente des authorized_keys de ce compte : vérifiez qu'elle est bien à vous.")
+            level, title = WARNING, "Connexion SSH avec une clé inconnue"
+            who = f"🔑 <code>{esc(login.fingerprint)}</code>"
     elif login.method == "password" or "keyboard-interactive" in login.method:
-        level = WARNING
-        who = "par <b>mot de passe</b> 🔓"
-        notes.append("💡 Préférez une clé SSH et désactivez PasswordAuthentication.")
+        level, title = WARNING, "Connexion SSH par mot de passe"
+        who = "🔓 mot de passe"
     else:
-        who = f"({esc(login.method)})"
+        who = esc(login.method)
     if login.user in ROOT_ACCEPT_WARNING:
         level = WARNING
-        notes.append("⚠️ Connexion directe en root : préférez un utilisateur + sudo.")
-
     if not first_ever and country and country not in known_countries:
-        level, title = CRITICAL, "Connexion SSH depuis un pays jamais vu"
-        notes.insert(0, "🚨 Si ce n'est pas vous : changez immédiatement les clés et vérifiez le serveur.")
-    elif previous:
-        notes.insert(0, f"✅ IP connue (dernière connexion il y a {human_duration(now - previous['last'])}, "
-                        f"{previous.get('count', 0) + 1} au total)")
-    elif not first_ever:
-        notes.insert(0, "🆕 Première connexion depuis cette IP")
+        level, title = CRITICAL, f"Connexion SSH depuis un pays jamais vu {geoip.flag(country)}".strip()
 
-    body = [f"👤 <b>{esc(login.user)}</b> {who}", f"🌍 {geoip.describe(login.ip, geo)}", *notes]
+    body = [f"👤 <b>{esc(login.user)}</b> · {who}"]
     return Alert(f"ssh:login:{login.user}:{login.ip}", level, title, "\n".join(body), stateful=False)
 
 

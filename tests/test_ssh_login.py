@@ -39,20 +39,22 @@ def test_known_key_known_ip_then_new_country(tmp_path, monkeypatch):
                       "198.51.100.7": {"country": "RU", "org": "Hosting Ltd"}})
     first = ssh.login_alert(cfg, state, ssh.Login("ubuntu", "203.0.113.10", "publickey", "ED25519", GITHUB_FP),
                             now=1000)
-    assert first.level == INFO and "🔑 <b>sinan@macbook</b>" in first.body and "🇫🇷 FR, Lyon · Free SAS" in first.body
+    assert first.level == INFO and first.body == "👤 <b>ubuntu</b> · 🔑 <b>sinan@macbook</b>"
     again = ssh.login_alert(cfg, state, ssh.Login("ubuntu", "203.0.113.10", "publickey", "ED25519", GITHUB_FP),
                             now=1000 + 2 * 86400)
-    assert "IP connue (dernière connexion il y a 2j" in again.body
+    assert again.level == INFO and again.body == first.body  # pas de détails superflus
     russia = ssh.login_alert(cfg, state, ssh.Login("ubuntu", "198.51.100.7", "publickey", "ED25519", "SHA256:autre"),
                              now=5000 + 2 * 86400)
-    assert russia.level == CRITICAL and "pays jamais vu" in russia.title and "clé inconnue" in russia.body
+    assert russia.level == CRITICAL and russia.title == "Connexion SSH depuis un pays jamais vu 🇷🇺"
+    assert russia.body == "👤 <b>ubuntu</b> · 🔑 <code>SHA256:autre</code>"
 
 
 def test_password_login_and_trusted_ip(tmp_path, monkeypatch):
     cfg = fake_host(tmp_path)
     geo(monkeypatch, {})
     alert = ssh.login_alert(cfg, State(cfg.state_file), ssh.Login("ubuntu", "203.0.113.10", "password"))
-    assert alert.level == WARNING and "mot de passe" in alert.body
+    assert alert.level == WARNING and alert.title == "Connexion SSH par mot de passe"
+    assert alert.body == "👤 <b>ubuntu</b> · 🔓 mot de passe"
     trusted = Config(token="x", chat_ids=frozenset({1}), host_root=tmp_path, state_file=tmp_path / "t.json",
                      ssh_trusted_ips=("203.0.113.10",))
     assert ssh.login_alert(trusted, State(trusted.state_file), ssh.Login("ubuntu", "203.0.113.10", "publickey")) is None
